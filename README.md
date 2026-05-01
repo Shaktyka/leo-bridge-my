@@ -1,8 +1,8 @@
 # Leo
 
-Корпоративный AI-ассистент для Respect.Chat. Работает в Matrix через E2EE, помнит пользователя между комнатами, управляет календарём и личной базой знаний.
+Корпоративный AI-ассистент для Respect.Chat. Работает в Matrix через E2EE, помнит пользователя между комнатами, управляет календарём, создаёт документы, ведёт личную базу знаний.
 
-Текущая версия: **v1.4.1**
+> Актуальную версию смотри в [Releases](https://github.com/slv1970/leo-bridge/releases) или в `health` endpoint: `curl http://127.0.0.1:9090/health`
 
 ## Стек
 
@@ -21,24 +21,29 @@ Claude Sonnet 4.6 (Anthropic API)
 - **Postgres** — личная KB (pgvector), `ai.user_memory`, `ai.user_rooms`, feedback, audit
 - **Radicale** (CalDAV) — per-user календари по схеме `/username/leo/`
 - **Caddy** — реверс-прокси для `cal.respectrb.ru` (TLS Let's Encrypt)
+- **pandoc + WeasyPrint** — генерация документов (DOCX, PDF, XLSX, PPTX, MD, HTML)
 
 ## Возможности
 
 **Память.** У каждого пользователя один shared `human` блок с фактами (имя, должность, таймзона, предпочтения). Один блок на все комнаты юзера — узнаёт везде. При накоплении 60k токенов агент пересоздаётся автоматически с тихим уведомлением, факты сохраняются.
 
-**Календарь.** Создание, поиск, отмена событий через CalDAV. Apple Calendar, Outlook, iPhone подключаются по `https://cal.respectrb.ru/username/leo/`. Напоминания за N минут до начала через ReminderWatcher (FS-scan ICS файлов, tick=60s).
+**Календарь.** Создание, поиск, отмена событий через CalDAV. Apple Calendar, Outlook, iPhone подключаются по `https://cal.respectrb.ru/username/leo/`. Напоминания за N минут до начала.
+
+**Файлы.** Leo создаёт документы прямо в чате — отчёты (DOCX/PDF), таблицы (XLSX), презентации (PPTX), заметки (MD/HTML). Достаточно попросить: «сделай отчёт», «создай презентацию», «сформируй PDF».
 
 **Личная KB.** Загрузка документов в чат → автоматический парсинг (PDF, DOCX, MD, TXT, XLSX, CSV, JSON), эмбеддинги OpenAI, гибридный поиск (ключевые слова + семантика).
 
 **Корпоративная KB.** Общие документы компании, поиск через `kb_search_corporate`.
 
-**Интернет-поиск.** Tool `internet_search` для актуальных данных.
+**Интернет-поиск.** Tool `internet_search` для актуальных данных (Tavily API).
 
 **Feedback.** Реакции 👍 / 👎 на ответы Leo пишутся в Postgres, дашборд показывает тренд.
 
 **Smart threading.** В групповых комнатах ответы Leo идут в треде, в DM — в основной ленте.
 
 **Empty rooms cleanup.** Если пользователь покинул комнату и остался только Leo — Leo автоматически выходит, агент удаляется.
+
+**Orphan auto-heal.** Legacy-агенты с per-agent блоками автоматически приводятся к актуальной архитектуре shared при первой активности.
 
 ## Slash-команды
 
@@ -58,7 +63,7 @@ Claude Sonnet 4.6 (Anthropic API)
 app/
   bridge.py             Matrix-клиент, callbacks, _on_message, auto-compact
   letta_client.py       HTTP-клиент к Letta API
-  internal_api.py       FastAPI на :8284 для tools (calendar/kb)
+  internal_api.py       FastAPI на :8284 для tools (calendar/kb/files)
   calendar_client.py    CalDAV клиент для Radicale
   kb_handler.py         ingest файлов в личную KB
   reminders.py          ReminderWatcher (FS-scan ICS)
@@ -68,6 +73,7 @@ app/
   leo_handler.py        /leo_* slash-команды
   room_mapping.py       bridge.sqlite room→agent
   timezone_resolver.py  user_tz из Matrix profile
+  file_generators/      генераторы документов (md/html/docx/pdf/xlsx/pptx)
 
 scripts/
   register_tools.py            регистрация custom tools в Letta
@@ -77,17 +83,6 @@ scripts/
 requirements.txt
 .gitignore
 ```
-
-## История релизов
-
-- **v1.4.1** — Empty Rooms Cleanup
-- **v1.4.0** — Core Memory shared block + Auto-Reset (60k threshold)
-- **v1.3.1** — Smart Threading (DM lenta, groups thread) + live upsert fix
-- **v1.3.0** — Public CalDAV + per-user коллекции + ReminderWatcher FS-scan
-- **v1.2.0** — Slash-команды + feedback dashboard
-- **v1.1.0** — Reminder customization (remind_minutes_before)
-- **v1.0.0** — первый production-релиз
-- **v0.x** — KB ingest, feedback, calendar tools
 
 ## Развёртывание
 
@@ -108,17 +103,27 @@ Systemd-сервисы:
 
 ```bash
 cd /opt/ai/bridge
+
+# Проверить статус
 git status
 
+# Закоммитить изменения
 git add -A
 git commit -m "vX.Y.Z: описание"
 git push
 
+# Релизный тег
 git tag -a vX.Y.Z -m "..."
 git push origin vX.Y.Z
 
+# Перезапуск сервисов
 sudo systemctl restart matrix-letta-bridge
+sudo systemctl restart bridge-internal-api
 ```
+
+## История релизов
+
+См. [Releases](https://github.com/slv1970/leo-bridge/releases) или `git log --oneline`.
 
 ## Лицензия
 
