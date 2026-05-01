@@ -122,4 +122,4 @@ sudo systemctl restart matrix-letta-bridge
 
 ## Лицензия
 
-Proprietary — Respect.Chat.
+Proprietary — ProjectDB.
