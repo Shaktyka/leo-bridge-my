@@ -1,0 +1,41 @@
+# Секреты — НИКОГДА не коммитить
+.env
+.env.local
+.env.production
+*.pem
+*.key
+
+# Данные приложения
+data/
+store/
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Логи
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup-файлы patcherов
+*.bak
+*.bak-*
