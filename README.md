@@ -2,7 +2,7 @@
 
 Корпоративный AI-ассистент для Respect.Chat. Работает в Matrix через E2EE, помнит пользователя между комнатами, управляет календарём, создаёт документы, ведёт личную базу знаний.
 
-> Актуальную версию смотри в [Releases](https://github.com/slv1970/leo-bridge/releases) или в `health` endpoint: `curl http://127.0.0.1:9090/health`
+> Актуальную версию смотри в [Tags](https://github.com/slv1970/leo-bridge/tags) или через `curl http://127.0.0.1:9090/health`
 
 ## Стек
 
@@ -121,9 +121,9 @@ sudo systemctl restart matrix-letta-bridge
 sudo systemctl restart bridge-internal-api
 ```
 
-## История релизов
+## История изменений
 
-См. [Releases](https://github.com/slv1970/leo-bridge/releases) или `git log --oneline`.
+См. [Tags](https://github.com/slv1970/leo-bridge/tags) или `git log --oneline`.
 
 ## Лицензия
 
