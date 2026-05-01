@@ -157,7 +157,7 @@ class LettaClient:
     # прицепляются ко всем новым агентам.
     # При добавлении новых tools — расширяй этот фильтр
     # ИЛИ функцию _is_our_tool ниже.
-    _OUR_TOOL_NAMES = {"internet_search"}
+    _OUR_TOOL_NAMES = {"internet_search", "leo_create_file"}
 
     @classmethod
     def _is_our_tool(cls, tool_name: str) -> bool:

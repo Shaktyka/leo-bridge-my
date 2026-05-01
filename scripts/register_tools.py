@@ -647,6 +647,81 @@ def kb_info_personal(matrix_user_id: str, source: str) -> str:
 # Регистрация в Letta
 # ============================================================
 
+def leo_create_file(
+    matrix_room_id: str,
+    creator_user_id: str,
+    filename: str,
+    format: str,
+    content_md: str = "",
+    content_json: str = "",
+    title: str = "",
+) -> str:
+    """Создать файл (md/html/docx/pdf/xlsx/pptx) и отправить в Matrix-чат.
+
+    Args:
+        matrix_room_id: ID Matrix-комнаты куда отправить файл.
+        creator_user_id: MXID отправителя из контекста.
+        filename: имя файла без расширения.
+        format: формат файла, один из md html docx pdf xlsx pptx.
+        content_md: содержимое в Markdown для текстовых форматов.
+        content_json: JSON-строка для xlsx и pptx.
+        title: опциональный заголовок документа.
+
+    Returns:
+        Строка с подтверждением или описанием ошибки.
+    """
+    import os
+    import json
+    import httpx
+
+    base = os.environ.get("BRIDGE_INTERNAL_URL", "http://127.0.0.1:8284")
+    token = os.environ.get("BRIDGE_INTERNAL_TOKEN", "")
+
+    if format not in ("md", "html", "docx", "pdf", "xlsx", "pptx"):
+        return f"Ошибка: формат {format!r} не поддерживается. Используй: md, html, docx, pdf, xlsx, pptx."
+
+    if format in ("xlsx", "pptx"):
+        if not content_json:
+            return f"Ошибка: для формата {format} нужен content_json."
+        try:
+            json.loads(content_json)
+        except Exception as e:
+            return f"Ошибка: content_json не валиден JSON: {e}"
+    else:
+        if not content_md:
+            return f"Ошибка: для формата {format} нужен content_md (markdown)."
+
+    payload = {
+        "matrix_room_id": matrix_room_id,
+        "creator_user_id": creator_user_id,
+        "filename": filename,
+        "format": format,
+        "content_md": content_md or None,
+        "content_json": content_json or None,
+        "title": title or None,
+    }
+
+    try:
+        r = httpx.post(
+            f"{base}/files/create",
+            headers={"X-Internal-Token": token},
+            json=payload,
+            timeout=120,
+        )
+    except Exception as e:
+        return f"Ошибка соединения: {e}"
+
+    if r.status_code >= 400:
+        return f"Ошибка создания файла: HTTP {r.status_code}: {r.text[:300]}"
+
+    data = r.json()
+    size_kb = data.get("size_bytes", 0) / 1024
+    return (
+        f"Файл {data.get('filename')} ({size_kb:.1f} KB, {format.upper()}) "
+        f"отправлен в чат."
+    )
+
+
 TOOLS = [
     calendar_create_event,
     calendar_list_events,
@@ -660,6 +735,7 @@ TOOLS = [
     kb_list_personal,
     kb_delete_personal,
     kb_info_personal,
+    leo_create_file,
 ]
 
 

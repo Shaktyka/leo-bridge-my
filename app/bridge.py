@@ -61,6 +61,7 @@ SYSTEM_PROMPT = """\
 - internet_search — веб-поиск (курсы, погода, новости, факты)
 - kb_search_corporate — корпоративная KB (общие документы)
 - kb_search_personal / kb_list_personal / kb_info_personal / kb_delete_personal — личная KB пользователя
+- leo_create_file — создать и отправить файл (md/html/docx/pdf/xlsx/pptx). Используй когда юзер просит "сделай отчёт", "создай презентацию", "сформируй PDF/Excel", или когда ответ — длинный структурированный документ который удобнее как файл.
 - memory_insert(label="human", content="...") — записать факт О ПОЛЬЗОВАТЕЛЕ в core memory
 - memory_replace(label, ...) — заменить устаревший факт в core memory
 - archival_memory_insert / archival_memory_search — резервный канал для длинных текстов
@@ -484,6 +485,8 @@ class Bridge:
         app["bridge"] = self
         app["pg_pool"] = pg_pool
         app.router.add_get("/health", self._handle_health)
+        # v1.5.0: file upload endpoint (вызывается из internal_api)
+        app.router.add_post("/internal/files/upload", self._handle_file_upload)
         runner = aiohttp_web.AppRunner(app, access_log=None)
         await runner.setup()
         site = aiohttp_web.TCPSite(runner, host="127.0.0.1", port=9090)
@@ -505,7 +508,7 @@ class Bridge:
         uptime = int(time.monotonic() - bridge._started_at)
         result: dict = {
             "status": "ok",
-            "version": "v1.4.2",
+            "version": "v1.5.0",
             "uptime_seconds": uptime,
             "started_at": bridge._started_at_iso,
             "letta_reachable": False,
@@ -563,6 +566,132 @@ class Bridge:
         # 4. HTTP code: 200 if ok, 503 otherwise
         http_code = 200 if result["status"] == "ok" else 503
         return aiohttp_web.json_response(result, status=http_code)
+
+    async def _handle_file_upload(self, request) -> "aiohttp_web.Response":
+        """
+        v1.5.0: загрузить файл в Matrix-комнату.
+
+        POST /internal/files/upload
+        Body: {
+            "file_path": "/tmp/leo_test/file.docx",
+            "room_id": "!XXXX:server",
+            "filename": "report.docx",
+            "delete_after": true  # удалять файл после загрузки
+        }
+        Returns: {"event_id": "$...", "size": 12345}
+        """
+        try:
+            body = await request.json()
+            file_path = body.get("file_path")
+            room_id = body.get("room_id")
+            filename = body.get("filename") or "file"
+            delete_after = bool(body.get("delete_after", True))
+
+            if not file_path or not room_id:
+                return aiohttp_web.json_response(
+                    {"error": "file_path and room_id required"}, status=400,
+                )
+
+            from pathlib import Path
+            fp = Path(file_path)
+            if not fp.exists():
+                return aiohttp_web.json_response(
+                    {"error": f"file not found: {file_path}"}, status=404,
+                )
+
+            file_size = fp.stat().st_size
+            mime_type = self._guess_mime(filename)
+
+            # Найдём комнату
+            room = self.client.rooms.get(room_id)
+            if room is None:
+                return aiohttp_web.json_response(
+                    {"error": f"room not joined: {room_id}"}, status=404,
+                )
+
+            # Загружаем в Synapse media (с E2EE если комната зашифрована)
+            encrypt = bool(room.encrypted)
+            with open(fp, "rb") as f:
+                resp, decryption_keys = await self.client.upload(
+                    lambda *_: f,
+                    content_type=mime_type,
+                    filename=filename,
+                    encrypt=encrypt,
+                    filesize=file_size,
+                )
+
+            if not hasattr(resp, "content_uri"):
+                self.log.error("upload failed: %s", resp)
+                return aiohttp_web.json_response(
+                    {"error": f"upload failed: {resp}"}, status=502,
+                )
+
+            content_uri = resp.content_uri
+            self.log.info(
+                "[%s] file uploaded: %s -> %s (%d bytes, encrypt=%s)",
+                room_id[:12], filename, content_uri, file_size, encrypt,
+            )
+
+            # Формируем m.room.message с msgtype=m.file
+            msg_content = {
+                "msgtype": "m.file",
+                "body": filename,
+                "info": {"size": file_size, "mimetype": mime_type},
+            }
+            if encrypt and decryption_keys:
+                msg_content["file"] = {
+                    "url": content_uri,
+                    **decryption_keys,
+                }
+            else:
+                msg_content["url"] = content_uri
+
+            send_resp = await self.client.room_send(
+                room_id,
+                message_type="m.room.message",
+                content=msg_content,
+                ignore_unverified_devices=True,
+            )
+
+            event_id = getattr(send_resp, "event_id", None)
+            self.log.info(
+                "[%s] file message sent: event_id=%s",
+                room_id[:12], event_id,
+            )
+
+            if delete_after:
+                try:
+                    fp.unlink()
+                except Exception as e:
+                    self.log.warning("cleanup tmp file failed: %s", e)
+
+            return aiohttp_web.json_response({
+                "ok": True,
+                "event_id": event_id,
+                "content_uri": content_uri,
+                "size": file_size,
+                "encrypted": encrypt,
+            })
+        except Exception as e:
+            self.log.exception("_handle_file_upload failed: %s", e)
+            return aiohttp_web.json_response(
+                {"error": str(e)}, status=500,
+            )
+
+    @staticmethod
+    def _guess_mime(filename: str) -> str:
+        """Простой mime-mapping по расширению."""
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        return {
+            "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "pdf":  "application/pdf",
+            "html": "text/html",
+            "md":   "text/markdown",
+            "txt":  "text/plain",
+        }.get(ext, "application/octet-stream")
+
 
     async def _on_message(self, room: MatrixRoom, event: RoomMessageText) -> None:
         if event.sender == self.cfg.user_id:

@@ -80,6 +80,17 @@ class NotifyReq(BaseModel):
     matrix_room_id: str
     text: str
 
+class CreateFileReq(BaseModel):
+    """v1.5.0: запрос на создание и отправку файла в Matrix."""
+    matrix_room_id: str
+    creator_user_id: str | None = None
+    filename: str
+    format: str  # "md"|"html"|"docx"|"pdf"|"xlsx"|"pptx"
+    content_md: str | None = None
+    content_json: str | None = None
+    title: str | None = None
+
+
 # ----- Auth -----
 class KbSearchCorporateReq(BaseModel):
     query: str = Field(..., description="Текст поискового запроса от LLM")
@@ -719,6 +730,114 @@ async def kb_personal_info(
         "first_added": row["first_added"].isoformat() if row["first_added"] else None,
         "last_added": row["last_added"].isoformat() if row["last_added"] else None,
     }
+
+
+@app.post("/files/create")
+async def create_file(req: CreateFileReq, _: None = Depends(check_auth)) -> dict[str, Any]:
+    """
+    v1.5.0: сгенерировать файл и отправить в Matrix-комнату.
+
+    Поток:
+    1. Валидация формата
+    2. Генерация файла во временной директории
+    3. POST /internal/files/upload на bridge:9090 — загрузка в Matrix
+    4. Удаление временного файла (через delete_after=true в bridge handler)
+    5. Возврат статуса в Letta
+    """
+    import httpx
+    import uuid
+    from pathlib import Path
+    from app.file_generators import GENERATORS
+
+    fmt = req.format.lower().strip()
+    if fmt not in GENERATORS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported format: {fmt}. Available: {list(GENERATORS.keys())}",
+        )
+
+    # Подготовка имени файла
+    filename = req.filename
+    if not filename.lower().endswith(f".{fmt}"):
+        filename = f"{filename}.{fmt}"
+
+    # Workdir (shared между bridge и internal_api)
+    workdir = Path("/opt/ai/bridge/data/files_tmp")
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    # Уникальное имя на диске чтобы не было гонок
+    tmp_name = f"{uuid.uuid4().hex}.{fmt}"
+    tmp_path = workdir / tmp_name
+
+    try:
+        # 1. Генерация
+        try:
+            GENERATORS[fmt](
+                tmp_path,
+                content_md=req.content_md,
+                content_json=req.content_json,
+                title=req.title,
+            )
+        except Exception as e:
+            log.exception("generation failed for fmt=%s: %s", fmt, e)
+            raise HTTPException(status_code=500, detail=f"generation failed: {e}")
+
+        if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+            raise HTTPException(status_code=500, detail="generated file is empty")
+
+        size = tmp_path.stat().st_size
+
+        # 2. Отправка в bridge для upload в Matrix
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(
+                    "http://127.0.0.1:9090/internal/files/upload",
+                    json={
+                        "file_path": str(tmp_path),
+                        "room_id": req.matrix_room_id,
+                        "filename": filename,
+                        "delete_after": True,
+                    },
+                )
+                if r.status_code >= 400:
+                    log.error("bridge upload failed: %s %s", r.status_code, r.text[:200])
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"bridge upload returned {r.status_code}",
+                    )
+                upload_data = r.json()
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"bridge unreachable: {e}")
+
+        log.info(
+            "create_file ok: fmt=%s name=%s size=%d event=%s",
+            fmt, filename, size, upload_data.get("event_id"),
+        )
+
+        return {
+            "ok": True,
+            "filename": filename,
+            "format": fmt,
+            "size_bytes": size,
+            "event_id": upload_data.get("event_id"),
+            "encrypted": upload_data.get("encrypted"),
+        }
+    except HTTPException:
+        # Cleanup on error
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+        raise
+    except Exception as e:
+        log.exception("create_file unexpected error: %s", e)
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 def serve() -> None:
