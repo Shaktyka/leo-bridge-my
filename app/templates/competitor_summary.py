@@ -1,8 +1,13 @@
 """
-v1.7.0 шаблон #3: competitor_summary.
+v1.7.1 шаблон #3: competitor_summary с кешем.
 
-FTS-поиск всех материалов про указанного конкурента, далее
-отправка топ-N карточек в GPT-4o-mini для формирования сводки тезисов.
+Изменения относительно v1.7.0:
+- Перед вызовом GPT проверяем ai.report_cache по ключу
+  cache_make_key("competitor_summary", {competitor, limit}).
+- Если кеш-хит и не устарел (TTL по env LEO_TEMPLATES_CACHE_TTL_HOURS=24) —
+  возвращаем сохранённый content_md без вызова LLM.
+- Если кеш miss — обычный flow, потом cache_set.
+- В возвращаемом dict добавлено поле "cache_hit": bool.
 """
 from __future__ import annotations
 
@@ -12,6 +17,9 @@ from typing import Any
 import asyncpg
 
 from app.templates.base import (
+    cache_get,
+    cache_make_key,
+    cache_set,
     fmt_date,
     format_attachments,
     format_section_path,
@@ -53,6 +61,24 @@ async def render(
     limit = int(params.get("limit", 15))
     limit = max(1, min(50, limit))
 
+    # ----- v1.7.1: проверка кеша -----
+    cache_key = cache_make_key(
+        "competitor_summary",
+        {"competitor": competitor.lower(), "limit": limit},
+    )
+    cached_md = await cache_get(leo_pool, cache_key)
+    if cached_md:
+        today = datetime.now().strftime("%Y%m%d")
+        safe_competitor = "".join(c if c.isalnum() else "_" for c in competitor)[:30]
+        return {
+            "filename": f"competitor_{safe_competitor}_{today}",
+            "format": "docx",
+            "title": f"Сводка по конкуренту: {competitor}",
+            "content_md": cached_md,
+            "cache_hit": True,
+        }
+    # ----- /v1.7.1 -----
+
     # ACL
     accessible_ids = await get_accessible_ids(matrix_user_id)
     if not accessible_ids:
@@ -61,7 +87,6 @@ async def render(
             "У вас нет доступа к корпоративной KB Респект.Чата либо ACL недоступен.",
         )
 
-    # FTS-поиск с весами и snippet
     sql = """
         SELECT
             content_id,
@@ -85,8 +110,7 @@ async def render(
             f"По конкуренту «{competitor}» в KB ничего не найдено.",
         )
 
-    # Готовим контекст для LLM (обрезаем тело до разумного размера)
-    MAX_BODY_PER_CARD = 1500  # символов
+    MAX_BODY_PER_CARD = 1500
     cards_for_llm: list[str] = []
     for i, r in enumerate(rows, 1):
         body = (r.get("indexable_text") or "").strip()
@@ -112,11 +136,9 @@ async def render(
         max_tokens=2000,
     )
 
-    # Подгружаем attachments для приложений
     cids = [r["content_id"] for r in rows]
     atts_by_cid = await get_attachments_for_cards(leo_pool, cids)
 
-    # Финальный документ
     lines: list[str] = []
     lines.append(f"# Сводка по конкуренту: {competitor}")
     lines.append("")
@@ -152,16 +174,24 @@ async def render(
         lines.append("")
 
     content_md = "\n".join(lines)
+
+    # ----- v1.7.1: записать в кеш -----
+    try:
+        await cache_set(leo_pool, cache_key, content_md)
+    except Exception:
+        # cache_set ошибка не должна валить рендер — лог уже внутри
+        pass
+    # ----- /v1.7.1 -----
+
     today = datetime.now().strftime("%Y%m%d")
-    safe_competitor = "".join(
-        c if c.isalnum() else "_" for c in competitor
-    )[:30]
+    safe_competitor = "".join(c if c.isalnum() else "_" for c in competitor)[:30]
 
     return {
         "filename": f"competitor_{safe_competitor}_{today}",
         "format": "docx",
         "title": f"Сводка по конкуренту: {competitor}",
         "content_md": content_md,
+        "cache_hit": False,
     }
 
 
@@ -172,4 +202,5 @@ def _empty_doc(title: str, message: str) -> dict[str, Any]:
         "format": "md",
         "title": title,
         "content_md": md,
+        "cache_hit": False,
     }

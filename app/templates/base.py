@@ -1,17 +1,19 @@
 """
-v1.7.0: Общие хелперы для шаблонов.
+v1.7.1: Общие хелперы для шаблонов.
 
-Содержит:
-- access_id_filter: получение списка доступных content_id для юзера
-- get_attachments_for_cards: подгрузка attachments для списка карточек
-- format_section_path: красивое отображение section_path (от корня к листу)
-- gpt_summarize: суммаризация текста через GPT-4o-mini
+Дополнения относительно v1.7.0:
+- cache_get / cache_set / cache_make_key — TTL-кеш в ai.report_cache
+- history_log — запись в ai.report_history
+- render_chart_png — генерация PNG-графика (matplotlib) для встраивания в docx
 """
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import asyncpg
@@ -24,21 +26,18 @@ log = logging.getLogger("templates.base")
 SUMMARY_MODEL = os.environ.get("LEO_TEMPLATES_GPT_MODEL", "gpt-4o-mini")
 SUMMARY_TIMEOUT = float(os.environ.get("LEO_TEMPLATES_GPT_TIMEOUT_S", "60"))
 
+# v1.7.1: TTL для кеша в часах (по умолчанию 24)
+CACHE_TTL_HOURS = int(os.environ.get("LEO_TEMPLATES_CACHE_TTL_HOURS", "24"))
+
 
 # ----------------------------------------------------------------------------
-# ACL: получить доступные content_id для пользователя
+# ACL
 # ----------------------------------------------------------------------------
 async def get_accessible_ids(matrix_user_id: str) -> list[int]:
-    """Получить список content_id, доступных пользователю.
-
-    Использует respect_db.RespectDBClient (если RESPECT_DATABASE_URL задан),
-    иначе возвращает пустой список (templates fail-closed).
-    """
     if not os.environ.get("RESPECT_DATABASE_URL"):
         log.warning("RESPECT_DATABASE_URL not set, ACL check unavailable")
         return []
 
-    # Один-разовый коннект (избегаем лишних зависимостей от shared pool)
     from app.respect_db import RespectDBClient
     try:
         async with RespectDBClient.from_env() as client:
@@ -49,16 +48,12 @@ async def get_accessible_ids(matrix_user_id: str) -> list[int]:
 
 
 # ----------------------------------------------------------------------------
-# Attachments: подгрузка для списка карточек
+# Attachments
 # ----------------------------------------------------------------------------
 async def get_attachments_for_cards(
     leo_pool: asyncpg.Pool,
     content_ids: list[int],
 ) -> dict[int, list[dict]]:
-    """Вернуть {content_id: [{name, url, type}, ...]}.
-
-    Только реальные ссылки. Карточки без attachments в результате не присутствуют.
-    """
     if not content_ids:
         return {}
 
@@ -90,26 +85,16 @@ async def get_attachments_for_cards(
 # Форматирование
 # ----------------------------------------------------------------------------
 def format_section_path(section_path: list[str] | None, max_depth: int = 4) -> str:
-    """Превратить section_path в читаемый путь.
-
-    section_path в БД хранится от листа к корню — здесь разворачиваем
-    к человекочитаемому виду 'Корень → Подраздел → ... → Лист'.
-
-    max_depth: показать максимум N уровней (от корня), остальное — "...".
-    """
     if not section_path:
         return "—"
-    # Разворачиваем
     reversed_path = list(reversed(section_path))
     if len(reversed_path) > max_depth:
-        # Берём первые max_depth уровней + многоточие
         shown = reversed_path[:max_depth]
         return " → ".join(shown) + " → …"
     return " → ".join(reversed_path)
 
 
 def get_root_section(section_path: list[str] | None) -> str:
-    """Получить корневой раздел (последний элемент массива в нашей схеме)."""
     if not section_path:
         return "—"
     return section_path[-1]
@@ -127,7 +112,6 @@ _FILE_ICONS = {
 
 
 def format_attachments(attachments: list[dict]) -> str:
-    """Форматировать список вложений в Markdown-список со ссылками."""
     if not attachments:
         return ""
     lines = []
@@ -143,10 +127,115 @@ def format_attachments(attachments: list[dict]) -> str:
 
 
 def fmt_date(dt: datetime | None) -> str:
-    """Дата в коротком виде YYYY-MM-DD."""
     if dt is None:
         return "—"
     return dt.strftime("%Y-%m-%d")
+
+
+# ----------------------------------------------------------------------------
+# v1.7.1: Кеш с TTL
+# ----------------------------------------------------------------------------
+def cache_make_key(template_name: str, params: dict[str, Any]) -> str:
+    """Стабильный ключ кеша: <template>:<sha256(canonical_json_params)>.
+
+    Параметры сортируются по ключам для канонической формы.
+    """
+    canon = json.dumps(params, sort_keys=True, ensure_ascii=False)
+    h = hashlib.sha256(canon.encode("utf-8")).hexdigest()[:32]
+    return f"{template_name}:{h}"
+
+
+async def cache_get(
+    leo_pool: asyncpg.Pool,
+    cache_key: str,
+) -> str | None:
+    """Получить content_md из кеша если есть и не устарел.
+
+    При hit инкрементирует hit_count.
+    """
+    sql = """
+        UPDATE ai.report_cache
+           SET hit_count = hit_count + 1
+         WHERE cache_key = $1
+           AND expires_at > now()
+        RETURNING content_md
+    """
+    async with leo_pool.acquire() as conn:
+        row = await conn.fetchrow(sql, cache_key)
+    return row["content_md"] if row else None
+
+
+async def cache_set(
+    leo_pool: asyncpg.Pool,
+    cache_key: str,
+    content_md: str,
+    ttl_hours: int | None = None,
+) -> None:
+    """Записать в кеш с TTL."""
+    ttl = ttl_hours or CACHE_TTL_HOURS
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=ttl)
+    sql = """
+        INSERT INTO ai.report_cache (cache_key, content_md, expires_at)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (cache_key) DO UPDATE SET
+            content_md = EXCLUDED.content_md,
+            expires_at = EXCLUDED.expires_at,
+            created_at = now(),
+            hit_count = 0
+    """
+    async with leo_pool.acquire() as conn:
+        await conn.execute(sql, cache_key, content_md, expires_at)
+
+
+async def cache_cleanup_expired(leo_pool: asyncpg.Pool) -> int:
+    """Удалить устаревшие записи. Возвращает количество удалённых."""
+    sql = "DELETE FROM ai.report_cache WHERE expires_at <= now() RETURNING 1"
+    async with leo_pool.acquire() as conn:
+        rows = await conn.fetch(sql)
+    return len(rows)
+
+
+# ----------------------------------------------------------------------------
+# v1.7.1: История генераций
+# ----------------------------------------------------------------------------
+async def history_log(
+    *,
+    leo_pool: asyncpg.Pool,
+    template_name: str,
+    params: dict[str, Any],
+    matrix_user_id: str,
+    matrix_room_id: str,
+    duration_ms: int,
+    status: str,
+    file_size: int | None = None,
+    error_message: str | None = None,
+    cache_hit: bool = False,
+) -> int | None:
+    """Записать в ai.report_history."""
+    sql = """
+        INSERT INTO ai.report_history (
+            template_name, params_json, matrix_user_id, matrix_room_id,
+            duration_ms, status, file_size, error_message, cache_hit
+        ) VALUES ($1, $2::jsonb, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING id
+    """
+    try:
+        async with leo_pool.acquire() as conn:
+            return await conn.fetchval(
+                sql,
+                template_name,
+                json.dumps(params, ensure_ascii=False),
+                matrix_user_id,
+                matrix_room_id,
+                duration_ms,
+                status,
+                file_size,
+                error_message,
+                cache_hit,
+            )
+    except Exception as e:
+        log.warning("history_log failed: %s", e)
+        return None
 
 
 # ----------------------------------------------------------------------------
@@ -158,10 +247,6 @@ async def gpt_summarize(
     user_prompt: str,
     max_tokens: int = 1500,
 ) -> str:
-    """Дёрнуть GPT-4o-mini для суммаризации.
-
-    Возвращает текст ответа (Markdown). Если API упал — возвращает строку с ошибкой.
-    """
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         return "_(OPENAI_API_KEY не настроен — суммаризация недоступна)_"
@@ -194,3 +279,66 @@ async def gpt_summarize(
     except Exception as e:
         log.exception("GPT call failed: %s", e)
         return f"_(ошибка вызова LLM: {e})_"
+
+
+# ----------------------------------------------------------------------------
+# v1.7.1: Chart PNG (matplotlib)
+# ----------------------------------------------------------------------------
+def render_chart_png(
+    *,
+    title: str,
+    labels: list[str],
+    values: list[int],
+    width_inches: float = 6.0,
+    height_inches: float = 3.0,
+    dpi: int = 110,
+) -> bytes:
+    """Сгенерировать bar-chart PNG.
+
+    Возвращает bytes (можно сразу подставить в python-docx через io.BytesIO).
+    Если matplotlib не установлен или рендер упал — возвращает b'' (вызывающий
+    должен это уметь обработать).
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # без GUI
+        import matplotlib.pyplot as plt
+    except ImportError:
+        log.warning("matplotlib not available, skipping chart")
+        return b""
+
+    if not values or not labels or len(values) != len(labels):
+        return b""
+
+    try:
+        fig, ax = plt.subplots(figsize=(width_inches, height_inches), dpi=dpi)
+        bars = ax.bar(range(len(values)), values, color="#3a76c4", edgecolor="#1f4d8c")
+
+        # Подписи значений над столбиками
+        for bar, v in zip(bars, values):
+            if v > 0:
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height(),
+                    str(v),
+                    ha="center", va="bottom",
+                    fontsize=9, color="#333",
+                )
+
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
+        ax.set_title(title, fontsize=11, color="#222")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(True, axis="y", linestyle=":", alpha=0.5)
+        ax.set_axisbelow(True)
+        ax.margins(x=0.02)
+
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png", bbox_inches="tight")
+        plt.close(fig)
+        return buf.getvalue()
+    except Exception as e:
+        log.warning("chart render failed: %s", e)
+        return b""
