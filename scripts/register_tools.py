@@ -94,7 +94,9 @@ def calendar_list_events(
     creator_user_id: str = "",
 ) -> str:
     """
-    Получить список событий пользователя за период.
+    Текстовый список встреч из календаря в чат (НЕ docx-файл, НЕ отчёт). Используй для просмотровых запросов: "что у меня сегодня", 
+    "какие встречи завтра", "покажи расписание", "покажи календарь на эту неделю". НЕ ИСПОЛЬЗУЙ для запросов "сделай обзор/отчёт/ретроспективу" — для них 
+    есть leo_render_template(name="calendar_summary"), который создаёт docx-файл с LLM-обобщением.
 
     Args:
         matrix_room_id: ID Matrix-комнаты из контекста [matrix_room_id=...], начинается с "!".
@@ -781,9 +783,7 @@ def leo_render_template(
     topic: str = "",
     limit: int = 0,
 ) -> str:
-    """
-    Сгенерировать готовый отчёт по шаблону на основе корпоративной KB Респект.Чата
-    и отправить в Matrix-чат как docx-файл.
+    """Создать docx-отчёт по шаблону. ВЫЗЫВАЙ для "сделай обзор/отчёт/ретроспективу/сводку/подборку/дайджест": еженедельный обзор инфоповодов (weekly_infopovody), изменений в KB (kb_changes_digest), сводки по конкуренту (competitor_summary), подборки по теме (topic_compendium), обзора календаря за прошлую неделю (calendar_summary). Возвращает готовый файл в чат, не текстовый ответ. Для календаря ИСПОЛЬЗУЙ это вместо calendar_list_events когда юзер просит "обзор", "отчёт", "ретроспективу".
 
     Args:
         name: имя шаблона. Поддерживаемые:
@@ -809,11 +809,17 @@ def leo_render_template(
         - "Что у нас обновилось в KB за последнюю неделю" → kb_changes_digest
         - "Сделай сводку по Гаранту" / "что есть про КонсультантПлюс" → competitor_summary
         - "Подбери всё про командировки" / "сделай подборку по НДФЛ" → topic_compendium
+        - "Сделай обзор моего календаря" / "отчёт по календарю" / "как прошла неделя"
+          / "ретроспектива встреч" → calendar_summary (создаёт docx-файл!).
+          Это ПРИОРИТЕТНЫЙ выбор для запросов про "обзор/отчёт/анализ" календаря —
+          НЕ используй calendar_list_events для таких запросов, calendar_list_events
+          только для простого "покажи встречи / какие встречи на той неделе".
 
     Когда НЕ использовать:
         - Простой поисковый запрос — используй respect_kb_search вместо этого
         - Если шаблон не подходит под запрос пользователя — лучше respect_kb_search
         - Если пользователь хочет сам читать ответ в чате (не файлом) — respect_kb_search
+        - Простой просмотр встреч "что у меня сегодня" → calendar_list_events
     """
     import os
     import httpx
@@ -979,26 +985,63 @@ def main() -> None:
     r.raise_for_status()
     existing = {t["name"]: t["id"] for t in r.json()}
 
+    # v1.8.4: подгружаем существующие tool'ы целиком (с description),
+    # чтобы понимать когда description изменился и нужен DELETE+POST вместо PATCH
+    r2 = httpx.get(f"{LETTA_URL}/v1/tools/", headers=headers, timeout=30)
+    r2.raise_for_status()
+    existing_full = {t["name"]: t for t in r2.json()}
+
     for fn in TOOLS:
         name = fn.__name__
         source = inspect.getsource(fn)
+        # v1.8.4: явно достаём description из docstring (первый абзац до пустой строки).
+        # Letta берёт это как короткое описание tool'а, которое видит LLM-агент.
+        doc = (inspect.getdoc(fn) or "").strip()
+        description = doc.split("\n\n", 1)[0].strip()
         payload = {
             "source_code": source,
             "source_type": "python",
+            "description": description,
         }
 
         if name in existing:
             tool_id = existing[name]
-            r = httpx.patch(
-                f"{LETTA_URL}/v1/tools/{tool_id}",
-                headers=headers,
-                json=payload,
-                timeout=30,
-            )
-            print(f"Updated  {name:30s} -> {tool_id} [{r.status_code}]")
-            if r.status_code >= 400:
-                print(f"   Body: {r.text[:300]}")
-                sys.exit(1)
+            # v1.8.4: проверяем — изменилось ли description.
+            # Letta PATCH игнорирует description; если другой — делаем DELETE+POST.
+            current_desc = (existing_full.get(name, {}).get("description") or "").strip()
+            if current_desc != description:
+                print(f"Recreate {name:30s} -> description changed, DELETE+POST")
+                r = httpx.delete(
+                    f"{LETTA_URL}/v1/tools/{tool_id}",
+                    headers=headers,
+                    timeout=30,
+                )
+                if r.status_code >= 400:
+                    print(f"   DELETE failed: {r.status_code} {r.text[:300]}")
+                    sys.exit(1)
+                r = httpx.post(
+                    f"{LETTA_URL}/v1/tools/",
+                    headers=headers,
+                    json=payload,
+                    timeout=30,
+                )
+                if r.status_code >= 400:
+                    print(f"   POST failed: {r.status_code} {r.text[:500]}")
+                    sys.exit(1)
+                new_id = r.json().get("id")
+                print(f"  -> new tool_id: {new_id}")
+                print(f"  -> RUN attach_tools_to_agents.py to re-attach!")
+            else:
+                r = httpx.patch(
+                    f"{LETTA_URL}/v1/tools/{tool_id}",
+                    headers=headers,
+                    json=payload,
+                    timeout=30,
+                )
+                print(f"Updated  {name:30s} -> {tool_id} [{r.status_code}]")
+                if r.status_code >= 400:
+                    print(f"   Body: {r.text[:300]}")
+                    sys.exit(1)
         else:
             r = httpx.post(
                 f"{LETTA_URL}/v1/tools/",
@@ -1009,6 +1052,7 @@ def main() -> None:
             if r.status_code >= 400:
                 print(f"FAILED   {name}: {r.status_code} {r.text[:500]}")
                 sys.exit(1)
+            print(f"Created  {name:30s} -> {r.json().get('id')}")
             tool_id = r.json()["id"]
             print(f"Created  {name:30s} -> {tool_id}")
 

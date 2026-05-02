@@ -1,12 +1,11 @@
 """
-v1.8.0 шаблон #5: calendar_summary.
+v1.8.1 шаблон #5: calendar_summary с улучшенным пояснением периода.
 
-Ретроспектива по личному календарю юзера за прошлые N недель.
-- Берёт события из Radicale (через CalendarClient — глобальный per-user calendar)
-- Группирует по дням
-- Считает статистику (часы во встречах, кол-во встреч, повторяющиеся)
-- Отправляет в GPT-4o-mini для краткого summary
-- Формирует docx через стандартный поток v1.7.0
+Изменения относительно v1.8.0:
+- Период: прошлая завершённая неделя (Mon 00:00 — Sun 23:59 UTC).
+  Текущая неделя НЕ включается. Это семантика "прошлая завершённая неделя".
+- _empty_doc явно объясняет какой период взят и как расширить (weeks_back=2).
+- Даты в выводе локализованы на русский ("20 апреля — 26 апреля").
 """
 from __future__ import annotations
 
@@ -35,6 +34,21 @@ SYSTEM_PROMPT = (
 )
 
 
+_MONTHS_RU_GENITIVE = {
+    1: "января", 2: "февраля", 3: "марта", 4: "апреля",
+    5: "мая", 6: "июня", 7: "июля", 8: "августа",
+    9: "сентября", 10: "октября", 11: "ноября", 12: "декабря",
+}
+
+
+def _fmt_date_ru(dt: datetime) -> str:
+    """2026-04-20 → '20 апреля 2026'. Год опускается если совпадает с текущим."""
+    today = datetime.now(timezone.utc)
+    if dt.year == today.year:
+        return f"{dt.day} {_MONTHS_RU_GENITIVE[dt.month]}"
+    return f"{dt.day} {_MONTHS_RU_GENITIVE[dt.month]} {dt.year}"
+
+
 def _format_event_line(ev_dict: dict, user_tz: str = "UTC") -> str:
     """Одна строка события для вывода в Markdown."""
     start = ev_dict.get("start")
@@ -56,7 +70,6 @@ def _format_event_line(ev_dict: dict, user_tz: str = "UTC") -> str:
     time_str = "—"
     duration_str = ""
     if start and end:
-        # Просто HH:MM в исходной TZ
         time_str = f"{start.strftime('%H:%M')}–{end.strftime('%H:%M')}"
         dur_min = int((end - start).total_seconds() / 60)
         if dur_min >= 60:
@@ -73,7 +86,6 @@ def _format_event_line(ev_dict: dict, user_tz: str = "UTC") -> str:
 
 
 def _stats_from_events(events: list[dict]) -> dict:
-    """Сводка по событиям."""
     if not events:
         return {
             "count": 0, "total_minutes": 0, "longest_minutes": 0,
@@ -109,12 +121,10 @@ def _stats_from_events(events: list[dict]) -> dict:
         day_key = start.strftime("%Y-%m-%d")
         by_day_count[day_key] += 1
 
-        # Нормализуем title для подсчёта повторяемости
         title_norm = (ev.get("title") or "").strip().lower()
         if title_norm:
             titles_count[title_norm] += 1
 
-    # Регулярные = title встречается ≥3 раза
     repeating = [
         (title, cnt) for title, cnt in titles_count.most_common()
         if cnt >= 3
@@ -130,7 +140,6 @@ def _stats_from_events(events: list[dict]) -> dict:
 
 
 def _ascii_chart(by_day: dict[str, int], width: int = 30) -> str:
-    """ASCII bar-chart как в weekly_infopovody."""
     if not by_day:
         return ""
     max_v = max(by_day.values())
@@ -148,15 +157,32 @@ def _ascii_chart(by_day: dict[str, int], width: int = 30) -> str:
     return "\n".join(lines)
 
 
+def _calculate_period(weeks_back: int) -> tuple[datetime, datetime]:
+    """Прошлая(ие) завершённая(ые) календарная(ые) неделя(и) Mon-Sun.
+
+    weeks_back=1 → последняя завершённая Mon-Sun
+    weeks_back=2 → последние 2 завершённые недели (14 дней)
+
+    Возвращает (period_start, period_end). period_end ИСКЛЮЧИТЕЛЬНО
+    (= понедельник 00:00 текущей недели).
+    """
+    now = datetime.now(timezone.utc)
+    today_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    # weekday: 0=Mon, 6=Sun
+    this_monday = today_start - timedelta(days=today_start.weekday())
+    period_end = this_monday  # exclusive — Mon 00:00 текущей недели
+    period_start = this_monday - timedelta(weeks=weeks_back)
+    return period_start, period_end
+
+
 async def render(
     *,
     params: dict[str, Any],
     leo_pool: asyncpg.Pool,
     matrix_room_id: str,
     matrix_user_id: str,
-    cal_client: Any = None,  # v1.8.0: CalendarClient передаётся из internal_api
+    cal_client: Any = None,
 ) -> dict[str, Any]:
-    """Сформировать обзор календаря за прошлые N недель."""
     weeks_back = int(params.get("weeks_back", 1))
     weeks_back = max(1, min(8, weeks_back))
 
@@ -164,22 +190,15 @@ async def render(
         return _empty_doc(
             "Обзор календаря",
             "Календарный клиент недоступен на сервере.",
+            weeks_back=weeks_back,
         )
 
-    # Период: понедельник предыдущей недели → воскресенье предыдущей недели
-    # (или N недель если weeks_back > 1)
-    now = datetime.now(timezone.utc)
-    today_start = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
-    # Текущий день недели: 0=Mon, 6=Sun
-    today_weekday = today_start.weekday()
-    # Понедельник этой недели
-    this_monday = today_start - timedelta(days=today_weekday)
-    # Понедельник за N недель назад
-    period_start = this_monday - timedelta(weeks=weeks_back)
-    # Конец периода = понедельник этой недели (исключительно)
-    period_end = this_monday
+    period_start, period_end = _calculate_period(weeks_back)
+    # Для отображения юзеру: последний день периода = period_end - 1 day (включительно Sun)
+    period_end_inclusive = period_end - timedelta(days=1)
 
-    # Читаем события через cal_client
+    period_str = f"{_fmt_date_ru(period_start)} — {_fmt_date_ru(period_end_inclusive)}"
+
     try:
         events_dto = await cal_client.list_events(
             matrix_room_id=matrix_room_id,
@@ -192,21 +211,39 @@ async def render(
         return _empty_doc(
             f"Обзор календаря за {weeks_back} нед.",
             f"Ошибка чтения календаря: {e}",
+            weeks_back=weeks_back,
+            period_str=period_str,
         )
 
     events = [e.to_dict() for e in events_dto] if events_dto else []
 
     if not events:
+        # Улучшенное пояснение для пустого результата
+        explanation = (
+            f"За период **{period_str}** (прошлая завершённая "
+            f"{'неделя' if weeks_back == 1 else f'{weeks_back} нед.'}) "
+            f"в вашем календаре встреч не зафиксировано.\n\n"
+            f"### Почему период такой?\n\n"
+            f"Шаблон показывает **завершённые** недели Mon-Sun. "
+            f"Текущая неделя (которая ещё идёт) не включается — это сделано "
+            f"для ретроспективного анализа.\n\n"
+            f"### Что попробовать?\n\n"
+            f"- **Посмотреть события включая текущую неделю** — попроси "
+            f"вместо этого `calendar_list_events` за нужный период\n"
+            f"- **Расширить период** — повтори с параметром "
+            f"`weeks_back=2` (или больше) чтобы захватить шире.\n"
+            f"- **Свежие данные за «прошлую неделю» в широком смысле** — "
+            f"уточни какие именно даты тебя интересуют."
+        )
         return _empty_doc(
-            f"Обзор календаря за {weeks_back} нед.",
-            f"За период {fmt_date(period_start)} — {fmt_date(period_end)} "
-            f"в вашем календаре встреч не зафиксировано.",
+            f"Обзор календаря — {period_str}",
+            explanation,
+            weeks_back=weeks_back,
+            period_str=period_str,
         )
 
-    # Статистика
     stats = _stats_from_events(events)
 
-    # Группировка по дням
     by_day: dict[str, list[dict]] = defaultdict(list)
     for ev in events:
         start = ev.get("start")
@@ -222,8 +259,7 @@ async def render(
         day_key = start_dt.strftime("%Y-%m-%d")
         by_day[day_key].append(ev)
 
-    # ----- LLM summary -----
-    # Готовим краткую сводку для GPT
+    # LLM summary
     events_for_llm: list[str] = []
     for ev in events:
         start = ev.get("start", "")
@@ -232,7 +268,7 @@ async def render(
         events_for_llm.append(f"{start} — {end} :: {title}")
 
     user_prompt = (
-        f"Период: {fmt_date(period_start)} — {fmt_date(period_end)}\n"
+        f"Период: {period_str}\n"
         f"Всего встреч: {stats['count']}\n"
         f"Суммарно во встречах: {stats['total_minutes'] // 60}ч"
         f"{stats['total_minutes'] % 60:02d}м\n"
@@ -246,11 +282,15 @@ async def render(
         max_tokens=800,
     )
 
-    # ----- Документ -----
-    period_str = f"{fmt_date(period_start)} — {fmt_date(period_end)}"
-
+    # Документ
     lines: list[str] = []
-    lines.append(f"# Обзор календаря ({period_str})")
+    lines.append(f"# Обзор календаря — {period_str}")
+    lines.append("")
+    lines.append(
+        f"*Период: {fmt_date(period_start)} — {fmt_date(period_end_inclusive)} "
+        f"(прошлая завершённая "
+        f"{'неделя' if weeks_back == 1 else f'{weeks_back} нед.'}).*"
+    )
     lines.append("")
     lines.append(f"**Всего встреч:** {stats['count']}  ")
     total_h = stats["total_minutes"] // 60
@@ -265,13 +305,11 @@ async def render(
             lines.append(f"**Самая длинная встреча:** {lm}м")
     lines.append("")
 
-    # ASCII chart
     chart = _ascii_chart(stats["by_day_count"])
     if chart:
         lines.append(chart)
         lines.append("")
 
-    # LLM-обобщение
     lines.append("---")
     lines.append("")
     lines.append("## Ретроспектива (LLM)")
@@ -284,7 +322,6 @@ async def render(
     lines.append(summary_md)
     lines.append("")
 
-    # Регулярные встречи
     if stats["repeating"]:
         lines.append("---")
         lines.append("")
@@ -294,7 +331,6 @@ async def render(
             lines.append(f"- **{title}** — {cnt} раз")
         lines.append("")
 
-    # Подробный список по дням
     lines.append("---")
     lines.append("")
     lines.append("## Все встречи по дням")
@@ -319,7 +355,7 @@ async def render(
         "format": "docx",
         "title": f"Обзор календаря {period_str}",
         "content_md": content_md,
-        "cache_hit": False,  # без кеша по дизайну
+        "cache_hit": False,
     }
 
 
@@ -330,7 +366,6 @@ _WEEKDAYS_RU = {
 
 
 def _weekday_ru(date_str: str) -> str:
-    """YYYY-MM-DD → название дня недели по-русски."""
     try:
         d = datetime.strptime(date_str, "%Y-%m-%d")
         return _WEEKDAYS_RU[d.weekday()]
@@ -338,10 +373,17 @@ def _weekday_ru(date_str: str) -> str:
         return ""
 
 
-def _empty_doc(title: str, message: str) -> dict[str, Any]:
+def _empty_doc(
+    title: str,
+    message: str,
+    *,
+    weeks_back: int = 1,
+    period_str: str = "",
+) -> dict[str, Any]:
+    """Пустой/информационный документ. v1.8.1: подробное пояснение периода."""
     md = f"# {title}\n\n{message}\n"
     return {
-        "filename": title.lower().replace(" ", "_")[:40] + "_empty",
+        "filename": title.lower().replace(" ", "_").replace("—", "_")[:40] + "_empty",
         "format": "md",
         "title": title,
         "content_md": md,
