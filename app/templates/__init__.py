@@ -1,21 +1,24 @@
 """
-v1.7.0: Реестр шаблонов отчётов.
+v1.8.0: Реестр шаблонов отчётов.
+
+Изменения от v1.7.0:
+- Добавлен calendar_summary в TEMPLATES.
+- render() теперь принимает опциональный cal_client (CalendarClient) и
+  пробрасывает его рендерерам, которым он нужен.
 
 Каждый шаблон — это (description, params_schema, renderer).
-Renderer — async-функция, которая:
-  1. Принимает params, leo_pool, matrix_room_id, matrix_user_id
-  2. Идёт в БД и/или в LLM
-  3. Возвращает {filename, format, content_md, title} — готовый для leo_create_file
-
-Регистрация нового шаблона: добавь импорт + запись в TEMPLATES.
+Renderer — async-функция, которая принимает (params, leo_pool, matrix_room_id,
+matrix_user_id, и опционально cal_client).
 """
 from __future__ import annotations
 
+import inspect
 from typing import Any, Awaitable, Callable
 
 import asyncpg
 
 from app.templates import (
+    calendar_summary,
     competitor_summary,
     kb_changes_digest,
     topic_compendium,
@@ -23,8 +26,6 @@ from app.templates import (
 )
 
 
-# (description, params_schema, renderer)
-# params_schema — словарь с описанием параметров для LLM
 TEMPLATES: dict[str, dict[str, Any]] = {
     "weekly_infopovody": {
         "description": (
@@ -57,7 +58,8 @@ TEMPLATES: dict[str, dict[str, Any]] = {
     "competitor_summary": {
         "description": (
             "Сводка по конкуренту с использованием LLM: находит до N материалов "
-            "про указанного конкурента и формирует краткие тезисы по теме."
+            "про указанного конкурента и формирует краткие тезисы по теме. "
+            "Кешируется на 24ч."
         ),
         "params": {
             "competitor": {
@@ -90,6 +92,21 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         },
         "renderer": topic_compendium.render,
     },
+    # v1.8.0
+    "calendar_summary": {
+        "description": (
+            "Ретроспектива по личному календарю за прошлые N недель: "
+            "статистика, повторяющиеся встречи, LLM-обзор главных тем недели."
+        ),
+        "params": {
+            "weeks_back": {
+                "type": "int",
+                "default": 1,
+                "description": "За сколько прошлых недель показать обзор (1-8).",
+            },
+        },
+        "renderer": calendar_summary.render,
+    },
 }
 
 
@@ -112,20 +129,31 @@ async def render(
     leo_pool: asyncpg.Pool,
     matrix_room_id: str,
     matrix_user_id: str,
+    cal_client: Any = None,
 ) -> dict[str, Any]:
     """Запустить рендер шаблона по имени.
 
-    Returns:
-        {filename, format, content_md, title} — готовое для leo_create_file
+    v1.8.0: автодетект сигнатуры рендерера. Шаблонам которым нужен cal_client
+    (calendar_summary), он пробрасывается; остальные (KB-шаблоны) получают
+    только базовый набор аргументов.
     """
     tmpl = TEMPLATES.get(name)
     if tmpl is None:
         raise ValueError(f"Unknown template: {name}. Available: {list(TEMPLATES.keys())}")
 
     renderer: Callable[..., Awaitable[dict[str, Any]]] = tmpl["renderer"]
-    return await renderer(
-        params=params,
-        leo_pool=leo_pool,
-        matrix_room_id=matrix_room_id,
-        matrix_user_id=matrix_user_id,
-    )
+
+    # Базовый набор аргументов
+    kwargs = {
+        "params": params,
+        "leo_pool": leo_pool,
+        "matrix_room_id": matrix_room_id,
+        "matrix_user_id": matrix_user_id,
+    }
+
+    # Если рендерер принимает cal_client — пробрасываем
+    sig = inspect.signature(renderer)
+    if "cal_client" in sig.parameters:
+        kwargs["cal_client"] = cal_client
+
+    return await renderer(**kwargs)

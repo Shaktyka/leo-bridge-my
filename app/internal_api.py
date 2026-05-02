@@ -946,6 +946,7 @@ async def templates_render(
                 leo_pool=state.pg_pool,
                 matrix_room_id=req.matrix_room_id,
                 matrix_user_id=req.matrix_user_id,
+                cal_client=getattr(state, "cal", None),  # v1.8.0
             )
             cache_hit = bool(rendered.get("cache_hit", False))
         except ValueError as e:
