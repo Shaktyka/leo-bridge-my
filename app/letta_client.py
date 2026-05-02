@@ -171,6 +171,7 @@ class LettaClient:
             tool_name.startswith("calendar_")
             or tool_name.startswith("kb_")
             or tool_name.startswith("respect_")
+            or tool_name.startswith("leo_")
             or tool_name in cls._OUR_TOOL_NAMES
         )
 
