@@ -29,6 +29,7 @@ from app.attachment_parser import (
     parse_blob,
 )
 from app.html_utils import html_to_plain
+from app.embedder import encode_passages, vector_literal, MODEL_TAG
 from app.respect_db import RespectDBClient
 
 
@@ -202,12 +203,29 @@ async def _upsert_content(
     indexable_parts = [body_plain] + texts
     indexable_text = "\n\n".join(p for p in indexable_parts if p).strip()
 
+    # v1.9.0: Compute embedding для новой/обновлённой карточки
+    try:
+        passage_text = f"{title}\n\n{indexable_text}"[:8000]  # обрезаем как в backfill
+        embeddings = await encode_passages([passage_text], batch_size=1)
+        embedding_literal = vector_literal(embeddings[0])
+        embedding_model = MODEL_TAG
+        embedding_updated_at = "now()"
+        log.debug(f"Computed embedding for content_id={cid}")
+    except Exception as e:
+        log.warning(f"Failed to compute embedding for content_id={cid}: {e}")
+        # Graceful degradation: embedding остаётся NULL
+        embedding_literal = None
+        embedding_model = None
+        embedding_updated_at = None
+
     await leo_conn.execute(
         """
         INSERT INTO ai.respect_kb (
             content_id, title, body_html, body_plain, indexable_text,
-            section_path, cover_image_url, actualized_at, updated_at, synced_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+            section_path, cover_image_url, actualized_at, updated_at, synced_at,
+            embedding, embedding_model, embedding_updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(),
+                  $10::vector, $11, $12)
         ON CONFLICT (content_id) DO UPDATE SET
             title           = EXCLUDED.title,
             body_html       = EXCLUDED.body_html,
@@ -218,12 +236,16 @@ async def _upsert_content(
             actualized_at   = EXCLUDED.actualized_at,
             updated_at      = EXCLUDED.updated_at,
             synced_at       = now()
+            embedding       = EXCLUDED.embedding,
+            embedding_model = EXCLUDED.embedding_model,
+            embedding_updated_at = EXCLUDED.embedding_updated_at
         """,
         cid, title, body_html, body_plain, indexable_text,
         row.get("section_path") or [],
         row.get("cover_image_url"),
         row.get("actualized_at"),
         row.get("updated_at") or datetime.now(timezone.utc),
+        embedding_literal, embedding_model, embedding_updated_at,
     )
 
     await leo_conn.execute(

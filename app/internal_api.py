@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 
 from app.calendar_client import CalendarClient
 from app.timezone_resolver import TimezoneResolver
-# v1.6.0: интеграция с КБ Респект.Чата
+# v1.9.0-alpha: интеграция с КБ Респект.Чата
 from app.respect_db import RespectDBClient
 from app.respect_kb_search import respect_kb_search as _respect_kb_search_impl
 
@@ -85,7 +85,7 @@ class NotifyReq(BaseModel):
     text: str
 
 class CreateFileReq(BaseModel):
-    """v1.5.0: запрос на создание и отправку файла в Matrix."""
+    """v1.9.0-alpha: запрос на создание и отправку файла в Matrix."""
     matrix_room_id: str
     creator_user_id: str | None = None
     filename: str
@@ -138,7 +138,7 @@ class State:
     pg_pool: asyncpg.Pool | None = None
     tz_resolver: TimezoneResolver | None = None
     matrix_send: Any = None  # callback из bridge для отправки в комнату
-    respect_client: RespectDBClient | None = None  # v1.6.0: КБ Респект.Чата
+    respect_client: RespectDBClient | None = None  # v1.9.0-alpha: КБ Респект.Чата
 
 state = State()
 
@@ -161,7 +161,7 @@ async def lifespan(app: FastAPI):
         matrix_token=os.environ["BRIDGE_ACCESS_TOKEN"],
     )
     await state.tz_resolver.__aenter__()
-    # v1.6.0: КБ Респект.Чата (опционально — если RESPECT_DATABASE_URL задан)
+    # v1.9.0-alpha: КБ Респект.Чата (опционально — если RESPECT_DATABASE_URL задан)
     if os.environ.get("RESPECT_DATABASE_URL"):
         try:
             state.respect_client = RespectDBClient.from_env()
@@ -231,7 +231,7 @@ async def list_events(req: ListEventsReq, _: None = Depends(check_auth)) -> dict
     assert state.cal
     df = datetime.fromisoformat(req.date_from_iso)
     dt = datetime.fromisoformat(req.date_to_iso)
-    # v1.3.0: автоподстановка creator_user_id из ai.user_rooms если не передан
+    # v1.9.0-alpha: автоподстановка creator_user_id из ai.user_rooms если не передан
     creator = req.creator_user_id
     if not creator and state.pg_pool:
         try:
@@ -256,7 +256,7 @@ async def find_events(req: FindEventsReq, _: None = Depends(check_auth)) -> dict
     assert state.cal
     df = datetime.fromisoformat(req.date_from_iso)
     dt = datetime.fromisoformat(req.date_to_iso)
-    # v1.3.0: автоподстановка creator_user_id из ai.user_rooms если не передан
+    # v1.9.0-alpha: автоподстановка creator_user_id из ai.user_rooms если не передан
     creator = req.creator_user_id
     if not creator and state.pg_pool:
         try:
@@ -278,7 +278,7 @@ async def find_events(req: FindEventsReq, _: None = Depends(check_auth)) -> dict
 @app.post("/calendar/delete")
 async def delete_event(req: DeleteEventReq, _: None = Depends(check_auth)) -> dict[str, Any]:
     assert state.cal
-    # v1.3.0: автоподстановка creator_user_id
+    # v1.9.0-alpha: автоподстановка creator_user_id
     del_creator = req.creator_user_id
     if not del_creator and state.pg_pool:
         try:
@@ -758,7 +758,7 @@ async def kb_personal_info(
 @app.post("/files/create")
 async def create_file(req: CreateFileReq, _: None = Depends(check_auth)) -> dict[str, Any]:
     """
-    v1.5.0: сгенерировать файл и отправить в Matrix-комнату.
+    v1.9.0-alpha: сгенерировать файл и отправить в Matrix-комнату.
 
     Поток:
     1. Валидация формата
@@ -865,7 +865,7 @@ async def create_file(req: CreateFileReq, _: None = Depends(check_auth)) -> dict
 
 
 # =============================================================================
-# v1.6.0: КБ Респект.Чата
+# v1.9.0-alpha: КБ Респект.Чата
 # =============================================================================
 class RespectKbSearchReq(BaseModel):
     query: str = Field(..., description="Текст поискового запроса")
@@ -877,7 +877,7 @@ class RespectKbSearchReq(BaseModel):
 async def respect_kb_search_endpoint(
     req: RespectKbSearchReq, _: None = Depends(check_auth)
 ) -> dict[str, Any]:
-    """v1.6.0: поиск в КБ Респект.Чата с учётом прав пользователя.
+    """v1.9.0-alpha: поиск в КБ Респект.Чата с учётом прав пользователя.
 
     ACL применяется на стороне Респект.Чата через PG-функцию
     kb_get_accessible_content_ids(matrix_user_id).
@@ -899,7 +899,7 @@ async def respect_kb_search_endpoint(
 
 
 # =============================================================================
-# v1.7.0: Templates
+# v1.9.0-alpha: Templates
 # =============================================================================
 class TemplatesListReq(BaseModel):
     pass  # без параметров
@@ -914,7 +914,7 @@ class TemplatesRenderReq(BaseModel):
 
 @app.post("/templates/list")
 async def templates_list(_: None = Depends(check_auth)) -> dict[str, Any]:
-    """v1.7.0: список доступных шаблонов."""
+    """v1.9.0-alpha: список доступных шаблонов."""
     from app.templates import list_templates
     return {"templates": list_templates()}
 
@@ -923,7 +923,7 @@ async def templates_list(_: None = Depends(check_auth)) -> dict[str, Any]:
 async def templates_render(
     req: TemplatesRenderReq, _: None = Depends(check_auth)
 ) -> dict[str, Any]:
-    """v1.7.1: отрендерить шаблон, отправить файл, залогировать в history."""
+    """v1.9.0-alpha: отрендерить шаблон, отправить файл, залогировать в history."""
     import time
     if state.pg_pool is None:
         raise HTTPException(status_code=503, detail="DB pool not ready")
@@ -946,7 +946,7 @@ async def templates_render(
                 leo_pool=state.pg_pool,
                 matrix_room_id=req.matrix_room_id,
                 matrix_user_id=req.matrix_user_id,
-                cal_client=getattr(state, "cal", None),  # v1.8.0
+                cal_client=getattr(state, "cal", None),  # v1.9.0-alpha
             )
             cache_hit = bool(rendered.get("cache_hit", False))
         except ValueError as e:
@@ -1019,7 +1019,7 @@ async def templates_render(
             log.warning("history_log skipped: %s", e)
 
 
-# v1.7.1: история генераций
+# v1.9.0-alpha: история генераций
 class TemplatesHistoryReq(BaseModel):
     template_name: str | None = Field(default=None, description="Фильтр по имени шаблона")
     matrix_user_id: str | None = Field(default=None, description="Фильтр по юзеру")
@@ -1030,7 +1030,7 @@ class TemplatesHistoryReq(BaseModel):
 async def templates_history(
     req: TemplatesHistoryReq, _: None = Depends(check_auth)
 ) -> dict[str, Any]:
-    """v1.7.1: вернуть последние записи из ai.report_history."""
+    """v1.9.0-alpha: вернуть последние записи из ai.report_history."""
     if state.pg_pool is None:
         raise HTTPException(status_code=503, detail="DB pool not ready")
 
