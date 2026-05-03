@@ -27,6 +27,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app.calendar_client import CalendarClient
+from app.retrieval import hybrid_search, TableSpec
 from app.timezone_resolver import TimezoneResolver
 # v1.9.0-alpha: интеграция с КБ Респект.Чата
 from app.respect_db import RespectDBClient
@@ -205,6 +206,17 @@ def _is_identifier_query(q: str) -> bool:
     """
     return bool(_IDENTIFIER_RE.match(q.strip()))
 
+
+
+
+# === v1.9.0-β: TableSpec для personal KB ===
+PERSONAL_KB_SPEC = TableSpec(
+    name="ai.ai_knowledge_personal",
+    pk="id",
+    fts_column="fts",
+    embedding_column="embedding",
+    text_columns=["source", "content"],
+)
 
 @app.post("/calendar/event")
 async def create_event(req: CreateEventReq, _: None = Depends(check_auth)) -> dict[str, Any]:
@@ -524,93 +536,75 @@ async def kb_search_personal(
     req: KbSearchPersonalReq, _: None = Depends(check_auth)
 ) -> dict[str, Any]:
     """
-    v0.8.6: гибридный поиск по личной KB.
-    Если query похож на идентификатор — сначала ILIKE, потом семантика.
+    v1.9.0-β: гибридный поиск по личной KB через unified retrieval.
+    Использует FTS + Vector (e5-large 1024-dim) + RRF + Cohere reranker.
     """
     assert state.pg_pool
-    emb = await _get_query_embedding(req.query)
-    emb_lit = _vector_literal(emb)
-
-    use_exact = _is_identifier_query(req.query)
-    exact_rows: list = []
-    excluded_ids: set = set()
 
     async with state.pg_pool.acquire() as conn:
-        if use_exact:
-            exact_sql = """
-                SELECT
-                    id::text AS id,
-                    source,
-                    NULL::text AS title,
-                    content,
-                    NULL::int AS chunk_index,
-                    NULL::text AS access_room_id,
-                    (LENGTH(content) - LENGTH(REPLACE(LOWER(content), LOWER($2), '')))::float8
-                        / GREATEST(LENGTH($2), 1) AS match_count,
-                    'exact'::text AS match_type
-                FROM ai.ai_knowledge_personal
-                WHERE matrix_user_id = $1
-                  AND content ILIKE '%' || $2 || '%'
-                ORDER BY match_count DESC, length(content) ASC
-                LIMIT $3;
-            """
-            exact_rows = await conn.fetch(
-                exact_sql, req.matrix_user_id, req.query, req.limit
+        # Hybrid search с фильтром по matrix_user_id
+        results = await hybrid_search(
+            conn=conn,
+            spec=PERSONAL_KB_SPEC,
+            query=req.query,
+            access_filter_sql="matrix_user_id = $1",
+            access_filter_params=[req.matrix_user_id],
+            limit=req.limit,
+        )
+
+        # Обогащаем результат полями source/content для совместимости с _format_kb_results
+        rows_dict = []
+        if results:
+            ids = [r["pk"] for r in results]
+            text_rows = await conn.fetch(
+                "SELECT id::text AS id, source, content "
+                "FROM ai.ai_knowledge_personal WHERE id = ANY($1::uuid[])",
+                ids,
             )
-            excluded_ids = {r["id"] for r in exact_rows}
+            id_to_text = {r["id"]: dict(r) for r in text_rows}
 
-        remaining = max(req.limit - len(exact_rows), 0)
-        semantic_rows: list = []
-        if remaining > 0:
-            if excluded_ids:
-                sem_sql = """
-                    SELECT
-                        id::text AS id,
-                        source,
-                        NULL::text AS title,
-                        content,
-                        NULL::int AS chunk_index,
-                        NULL::text AS access_room_id,
-                        1 - (embedding <=> $1::vector) AS sim,
-                        NULL::float8 AS match_count,
-                        'semantic'::text AS match_type
-                    FROM ai.ai_knowledge_personal
-                    WHERE matrix_user_id = $2
-                      AND id::text != ALL($4::text[])
-                    ORDER BY embedding <=> $1::vector
-                    LIMIT $3;
-                """
-                semantic_rows = await conn.fetch(
-                    sem_sql, emb_lit, req.matrix_user_id, remaining, list(excluded_ids)
-                )
-            else:
-                sem_sql = """
-                    SELECT
-                        id::text AS id,
-                        source,
-                        NULL::text AS title,
-                        content,
-                        NULL::int AS chunk_index,
-                        NULL::text AS access_room_id,
-                        1 - (embedding <=> $1::vector) AS sim,
-                        NULL::float8 AS match_count,
-                        'semantic'::text AS match_type
-                    FROM ai.ai_knowledge_personal
-                    WHERE matrix_user_id = $2
-                    ORDER BY embedding <=> $1::vector
-                    LIMIT $3;
-                """
-                semantic_rows = await conn.fetch(
-                    sem_sql, emb_lit, req.matrix_user_id, remaining
-                )
+            for r in results:
+                pk_str = str(r["pk"])
+                text_data = id_to_text.get(pk_str, {})
 
-    rows_dict = [dict(r) for r in list(exact_rows) + list(semantic_rows)]
+                # Определяем match_type для совместимости
+                if "cohere_score" in r:
+                    match_type = "cohere"
+                    match_score = float(r["cohere_score"])
+                elif "rrf_score" in r:
+                    match_type = "hybrid"
+                    match_score = float(r["rrf_score"])
+                elif "fts_rank" in r:
+                    match_type = "exact"
+                    match_score = float(r["fts_rank"])
+                else:
+                    match_type = "semantic"
+                    match_score = float(r.get("vec_sim", 0))
+
+                rows_dict.append({
+                    "id": pk_str,
+                    "source": text_data.get("source"),
+                    "title": None,
+                    "content": text_data.get("content"),
+                    "chunk_index": None,
+                    "access_room_id": None,
+                    "match_count": match_score if match_type == "exact" else None,
+                    "sim": match_score if match_type != "exact" else None,
+                    "match_type": match_type,
+                })
+
+    # Считаем "exact" для обратной совместимости (FTS-совпадения)
+    exact_count = sum(1 for r in rows_dict if r["match_type"] == "exact")
+
     return {
         "count": len(rows_dict),
-        "exact_count": len(exact_rows),
+        "exact_count": exact_count,
         "results": rows_dict,
         "formatted": _format_kb_results(rows_dict),
     }
+
+
+
 @app.post("/kb/personal/list")
 async def kb_personal_list(
     req: KbPersonalListReq, _: None = Depends(check_auth)
