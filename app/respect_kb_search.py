@@ -125,7 +125,7 @@ async def _enrich_results(
             title,
             indexable_text,
             cover_image_url,
-            ts_headline('russian', indexable_text, to_tsquery('russian', $1), 
+            ts_headline('russian', indexable_text, plainto_tsquery('russian', $1), 
                        'MaxWords=15, MinWords=10') AS snippet
         FROM ai.respect_kb 
         WHERE content_id = ANY($2)
@@ -137,12 +137,12 @@ async def _enrich_results(
     attach_sql = """
         SELECT 
             rca.content_id,
-            ra.filename,
-            ra.web_url
+            COALESCE(ra.file_name, rca.display_name) AS filename,
+            COALESCE(ra.url, rca.display_url) AS web_url
         FROM ai.respect_kb_content_attachments rca
-        JOIN ai.respect_kb_attachments ra ON rca.attachment_id = ra.attachment_id
+        JOIN ai.respect_kb_attachments ra ON rca.sha256 = ra.sha256
         WHERE rca.content_id = ANY($1)
-        ORDER BY rca.content_id, ra.filename
+        ORDER BY rca.content_id, filename
     """
     
     attach_rows = await conn.fetch(attach_sql, content_ids)
