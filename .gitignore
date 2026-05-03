@@ -39,3 +39,5 @@ Thumbs.db
 # Backup-файлы patcherов
 *.bak
 *.bak-*
+*.bak*
+git_commit_*.sh

@@ -13,6 +13,7 @@ v1.9.0: Unified hybrid retrieval для всех KB Leo.
 from __future__ import annotations
 
 import asyncio
+import time
 import logging
 import os
 from dataclasses import dataclass
@@ -28,6 +29,19 @@ log = logging.getLogger("retrieval")
 FTS_TOP_K = int(os.environ.get("LEO_FTS_TOP_K", "50"))
 VEC_TOP_K = int(os.environ.get("LEO_VEC_TOP_K", "50"))
 RRF_K = int(os.environ.get("LEO_RRF_K", "60"))
+# β-этап: Cohere reranker configuration
+COHERE_RERANK = os.environ.get("COHERE_RERANK", "true").lower() == "true"
+COHERE_MODEL = "rerank-multilingual-v3.0"
+COHERE_TOP_K = 20  # кандидатов для rerank
+
+# Инициализируем Cohere client
+try:
+    import cohere
+    COHERE_CLIENT = cohere.Client(os.environ.get("COHERE_API_KEY")) if os.environ.get("COHERE_API_KEY") else None
+except ImportError:
+    COHERE_CLIENT = None
+    log.warning("cohere library not installed")
+
 
 # Feature flags (default true для нового поведения)
 HYBRID = os.environ.get("RESPECT_KB_HYBRID", "true").lower() == "true"
@@ -43,6 +57,124 @@ class TableSpec:
     fts_column: str             # "fts"
     embedding_column: str       # "embedding"  
     text_columns: List[str]     # ["title", "indexable_text"] для rerank
+
+
+
+
+async def _cohere_rerank(
+    conn: asyncpg.Connection,
+    spec: TableSpec,
+    query: str,
+    candidates: List[Dict[str, Any]],
+    top_k: int = 5
+) -> List[Dict[str, Any]]:
+    """
+    Cohere rerank для финальной полировки результатов.
+    
+    Args:
+        conn: Database connection
+        spec: TableSpec для получения текстов
+        query: Исходный запрос
+        candidates: Кандидаты после RRF
+        top_k: Количество финальных результатов
+    
+    Returns:
+        Переранжированные результаты с cohere_score
+    """
+    if not COHERE_CLIENT:
+        log.warning("Cohere API key not configured - skipping rerank")
+        return candidates[:top_k]
+    
+    if len(candidates) <= top_k:
+        # Добавляем cohere_score = RRF score для совместимости
+        for c in candidates:
+            c["cohere_score"] = c.get("rrf_score", 0)
+        return candidates
+    
+    try:
+        start_time = time.time()
+        
+        # Получаем полные тексты для кандидатов
+        candidate_ids = [c["pk"] for c in candidates]
+        
+        # Формируем SQL для получения текстов
+        text_columns = ", ".join(spec.text_columns) if spec.text_columns else "content"
+        
+        texts_sql = f"""
+            SELECT {spec.pk}, {text_columns}
+            FROM {spec.name}
+            WHERE {spec.pk} = ANY($1::{spec.pk}[])
+        """
+        
+        # Определяем тип массива для SQL по имени таблицы и PK
+        if spec.pk == "id":  # UUID для personal KB
+            texts_sql = texts_sql.replace(f"{spec.pk}[]", "uuid[]")
+        elif spec.pk == "content_id":  # bigint для respect_kb
+            texts_sql = texts_sql.replace(f"{spec.pk}[]", "bigint[]")
+        else:  # text для остальных
+            texts_sql = texts_sql.replace(f"{spec.pk}[]", "text[]")
+        
+        text_rows = await conn.fetch(texts_sql, candidate_ids)
+        
+        # Создаём мапинг pk -> text
+        pk_to_text = {}
+        for row in text_rows:
+            # Объединяем все текстовые колонки
+            text_parts = []
+            for col in spec.text_columns or ["content"]:
+                if col in row and row[col]:
+                    text_parts.append(str(row[col]))
+            
+            full_text = " ".join(text_parts)
+            pk_to_text[row[spec.pk]] = full_text[:8000]  # Ограничиваем размер
+        
+        # Подготавливаем документы для Cohere
+        documents = []
+        candidate_map = {}
+        
+        for i, candidate in enumerate(candidates):
+            pk = candidate["pk"]
+            text = pk_to_text.get(pk, "")
+            
+            if text:  # Только документы с текстом
+                documents.append(text)
+                candidate_map[i] = candidate
+        
+        if not documents:
+            log.warning("No documents with text for Cohere rerank")
+            return candidates[:top_k]
+        
+        # Вызываем Cohere rerank
+        response = COHERE_CLIENT.rerank(
+            query=query,
+            documents=documents,
+            model=COHERE_MODEL,
+            top_n=min(top_k, len(documents)),
+            return_documents=False
+        )
+        
+        rerank_time = time.time() - start_time
+        
+        # Создаём результат
+        reranked = []
+        for result in response.results:
+            original_candidate = candidate_map[result.index]
+            
+            # Добавляем Cohere score
+            reranked_candidate = original_candidate.copy()
+            reranked_candidate["cohere_score"] = float(result.relevance_score)
+            reranked_candidate["cohere_rank"] = len(reranked) + 1
+            
+            reranked.append(reranked_candidate)
+        
+        log.debug(f"Cohere rerank: {len(candidates)}→{len(reranked)} in {rerank_time*1000:.0f}ms")
+        
+        return reranked
+        
+    except Exception as e:
+        log.error(f"Cohere rerank failed: {e}")
+        # Fallback на RRF результаты
+        return candidates[:top_k]
 
 
 async def hybrid_search(
@@ -97,7 +229,14 @@ async def hybrid_search(
         # TODO: β.2 — подгрузить text_columns и прогнать через Cohere
         log.debug("Reranker не реализован в α-этапе, используем RRF порядок")
     
-    return rrf_results[:limit]
+    # β-этап: Cohere reranker для финальной полировки
+    if COHERE_RERANK and len(rrf_results) > limit:
+        # Берём больше кандидатов для rerank
+        candidates = rrf_results[:COHERE_TOP_K]
+        final_results = await _cohere_rerank(conn, spec, query, candidates, limit)
+        return final_results
+    else:
+        return rrf_results[:limit]
 
 
 async def _fts_search(
@@ -114,18 +253,42 @@ async def _fts_search(
         # $N+1 потому что params уже заняты access_filter
         param_idx = len(access_filter_params) + 1
         
+        # Улучшенный FTS: более толерантный к multi-word запросам
         sql = f"""
             SELECT {spec.pk} AS pk,
                    ts_rank_cd({spec.fts_column}, 
-                             websearch_to_tsquery('russian', ${param_idx})) AS fts_rank
+                             plainto_tsquery('russian', ${param_idx})) AS fts_rank
             FROM {spec.name}
             WHERE {access_filter_sql}
-              AND {spec.fts_column} @@ websearch_to_tsquery('russian', ${param_idx})
+              AND {spec.fts_column} @@ plainto_tsquery('russian', ${param_idx})
             ORDER BY fts_rank DESC 
             LIMIT {FTS_TOP_K}
         """
         
         rows = await conn.fetch(sql, *access_filter_params, query)
+        
+        # v1.9.0 FTS fix: fallback если plainto_tsquery не дал результатов
+        if not rows and len(query.split()) > 1:
+            # Пробуем простой поиск по отдельным словам
+            words = [w for w in query.split() if len(w) > 2]  # игнорируем короткие слова
+            if words:
+                word_query = ' | '.join(words)  # OR логика
+                fallback_sql = f"""
+                    SELECT {spec.pk} AS pk,
+                           ts_rank_cd({spec.fts_column}, 
+                                     to_tsquery('russian', ${param_idx})) AS fts_rank
+                    FROM {spec.name}
+                    WHERE {access_filter_sql}
+                      AND {spec.fts_column} @@ to_tsquery('russian', ${param_idx})
+                    ORDER BY fts_rank DESC 
+                    LIMIT {FTS_TOP_K}
+                """
+                try:
+                    rows = await conn.fetch(fallback_sql, *access_filter_params, word_query)
+                    log.debug(f"FTS fallback для '{query}': {len(rows)} results")
+                except Exception as e:
+                    log.warning(f"FTS fallback failed for '{query}': {e}")
+        
         for row in rows:
             all_results.append({
                 "pk": row["pk"],
@@ -233,10 +396,10 @@ async def _fts_only(
     sql = f"""
         SELECT {spec.pk} AS pk,
                ts_rank_cd({spec.fts_column}, 
-                         websearch_to_tsquery('russian', ${param_idx})) AS fts_rank
+                         plainto_tsquery('russian', ${param_idx})) AS fts_rank
         FROM {spec.name}
         WHERE {access_filter_sql}
-          AND {spec.fts_column} @@ websearch_to_tsquery('russian', ${param_idx})
+          AND {spec.fts_column} @@ plainto_tsquery('russian', ${param_idx})
         ORDER BY fts_rank DESC 
         LIMIT {limit}
     """
