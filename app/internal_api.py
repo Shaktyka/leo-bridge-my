@@ -1084,5 +1084,22 @@ def serve() -> None:
     )
 
 
+
+
+# === v1.9.0-β: Prometheus metrics endpoint ===
+from fastapi import Response as _MetricsResponse
+from app.metrics import get_metrics_text
+
+
+@app.get("/metrics")
+async def metrics_endpoint() -> _MetricsResponse:
+    """
+    Prometheus exposition endpoint.
+    Без auth — стандартная практика для /metrics, scrape только из доверенной сети.
+    """
+    body, content_type = get_metrics_text()
+    return _MetricsResponse(content=body, media_type=content_type)
+
+
 if __name__ == "__main__":
     serve()

@@ -23,6 +23,11 @@ import asyncpg
 
 from app.embedder import encode_query, vector_literal
 from app.query_rewriter import rewrite_query, QUERY_REWRITE
+from app.metrics import (
+    SEARCH_TOTAL, SEARCH_DURATION, SEARCH_RESULTS_RETURNED,
+    FTS_RESULTS, VECTOR_RESULTS, RRF_TOP_SOURCE,
+    COHERE_CALLS, COHERE_DURATION,
+)
 
 log = logging.getLogger("retrieval")
 
@@ -84,12 +89,20 @@ async def _cohere_rerank(
     """
     if not COHERE_CLIENT:
         log.warning("Cohere API key not configured - skipping rerank")
+        try:
+            COHERE_CALLS.labels(result="skipped_no_key").inc()
+        except Exception:
+            pass
         return candidates[:top_k]
     
     if len(candidates) <= top_k:
         # Добавляем cohere_score = RRF score для совместимости
         for c in candidates:
             c["cohere_score"] = c.get("rrf_score", 0)
+        try:
+            COHERE_CALLS.labels(result="skipped_few_results").inc()
+        except Exception:
+            pass
         return candidates
     
     try:
@@ -170,10 +183,22 @@ async def _cohere_rerank(
         
         log.debug(f"Cohere rerank: {len(candidates)}→{len(reranked)} in {rerank_time*1000:.0f}ms")
         
+        # metrics
+        try:
+            COHERE_CALLS.labels(result="success").inc()
+            COHERE_DURATION.observe(rerank_time)
+        except Exception:
+            pass
+        
         return reranked
         
     except Exception as e:
         log.error(f"Cohere rerank failed: {e}")
+        # metrics
+        try:
+            COHERE_CALLS.labels(result="error").inc()
+        except Exception:
+            pass
         # Fallback на RRF результаты
         return candidates[:top_k]
 
@@ -204,6 +229,11 @@ async def hybrid_search(
         отсортированный по итоговому рангу
     """
     log.debug(f"hybrid_search: {spec.name}, query={query[:50]}..., limit={limit}")
+    
+    # === metrics (γ.4) ===
+    import time as _time
+    _t_start = _time.monotonic()
+    SEARCH_TOTAL.labels(kb=spec.name).inc()
     
     if not HYBRID:
         # Fallback: только FTS (legacy behavior)
@@ -244,10 +274,44 @@ async def hybrid_search(
     if COHERE_RERANK and len(rrf_results) > limit:
         # Берём больше кандидатов для rerank
         candidates = rrf_results[:COHERE_TOP_K]
+        # metrics: учитываем источник ТОП РЕЗУЛЬТАТА RRF (до Cohere)
+        if candidates:
+            _top = candidates[0]
+            _has_fts = "fts_rank" in _top
+            _has_vec = "vec_sim" in _top
+            if _has_fts and _has_vec:
+                _src = "both"
+            elif _has_fts:
+                _src = "fts_only"
+            else:
+                _src = "vector_only"
+            try:
+                RRF_TOP_SOURCE.labels(kb=spec.name, source=_src).inc()
+            except Exception:
+                pass
         final_results = await _cohere_rerank(conn, spec, query, candidates, limit)
+        # metrics
+        SEARCH_DURATION.labels(kb=spec.name, stage="total").observe(_time.monotonic() - _t_start)
+        SEARCH_RESULTS_RETURNED.labels(kb=spec.name).inc(len(final_results))
         return final_results
     else:
-        return rrf_results[:limit]
+        # metrics
+        results = rrf_results[:limit]
+        SEARCH_DURATION.labels(kb=spec.name, stage="total").observe(_time.monotonic() - _t_start)
+        SEARCH_RESULTS_RETURNED.labels(kb=spec.name).inc(len(results))
+        # Учитываем источник топ-результата для RRF (без Cohere)
+        if results:
+            top = results[0]
+            has_fts = "fts_rank" in top
+            has_vec = "vec_sim" in top
+            if has_fts and has_vec:
+                src_label = "both"
+            elif has_fts:
+                src_label = "fts_only"
+            else:
+                src_label = "vector_only"
+            RRF_TOP_SOURCE.labels(kb=spec.name, source=src_label).inc()
+        return results
 
 
 async def _fts_search(
@@ -315,7 +379,12 @@ async def _fts_search(
         if pk not in pk_best or row["fts_rank"] > pk_best[pk]["fts_rank"]:
             pk_best[pk] = row
     
-    return list(pk_best.values())
+    _fts_results = list(pk_best.values())
+    try:
+        FTS_RESULTS.labels(kb=spec.name).observe(len(_fts_results))
+    except Exception:
+        pass
+    return _fts_results
 
 
 async def _vector_search(
@@ -343,7 +412,7 @@ async def _vector_search(
     """
     
     rows = await conn.fetch(sql, *access_filter_params, query_literal)
-    return [
+    _vec_results = [
         {
             "pk": row["pk"],
             "vec_sim": float(row["vec_sim"]),
@@ -351,8 +420,11 @@ async def _vector_search(
         }
         for row in rows
     ]
-
-
+    try:
+        VECTOR_RESULTS.labels(kb=spec.name).observe(len(_vec_results))
+    except Exception:
+        pass
+    return _vec_results
 def _reciprocal_rank_fusion(
     fts_results: List[Dict[str, Any]], 
     vec_results: List[Dict[str, Any]],

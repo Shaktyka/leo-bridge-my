@@ -29,6 +29,15 @@ from typing import List, Optional
 
 log = logging.getLogger("query_rewriter")
 
+try:
+    from app.metrics import (
+        QUERY_REWRITE_CALLS, QUERY_REWRITE_DURATION,
+        QUERY_REWRITE_VARIANTS, QUERY_REWRITE_CACHE_SIZE,
+    )
+    _METRICS_AVAILABLE = True
+except ImportError:
+    _METRICS_AVAILABLE = False
+
 # === Feature flag ===
 QUERY_REWRITE = os.environ.get("QUERY_REWRITE", "true").lower() == "true"
 HAIKU_MODEL = os.environ.get("HAIKU_MODEL", "claude-haiku-4-5-20251001")
@@ -171,20 +180,37 @@ async def rewrite_query(query: str) -> list[str]:
     word_count = len(query.split())
     if word_count > MAX_WORDS_FOR_REWRITE:
         log.debug(f"Skip rewrite for long query ({word_count} words)")
+        if _METRICS_AVAILABLE:
+            QUERY_REWRITE_CALLS.labels(result="skip_long").inc()
         return [query]
     
     # Feature flag
     if not QUERY_REWRITE:
+        if _METRICS_AVAILABLE:
+            QUERY_REWRITE_CALLS.labels(result="skip_disabled").inc()
         return [query]
     
     # Cache check
     cached = _cache_get(query)
     if cached is not None:
         log.debug(f"Cache hit for '{query[:40]}'")
+        if _METRICS_AVAILABLE:
+            QUERY_REWRITE_CALLS.labels(result="cache_hit").inc()
         return cached
     
     # Haiku call
+    import time as _time
+    _t_start = _time.monotonic()
     rewrites = await _haiku_rewrite(query)
+    _duration = _time.monotonic() - _t_start
+    
+    if _METRICS_AVAILABLE:
+        if rewrites:
+            QUERY_REWRITE_CALLS.labels(result="success").inc()
+            QUERY_REWRITE_DURATION.observe(_duration)
+            QUERY_REWRITE_VARIANTS.observe(len(rewrites))
+        else:
+            QUERY_REWRITE_CALLS.labels(result="error").inc()
     
     # Собираем итоговый список: original first, потом rewrites
     # Дедупликация на случай если Haiku вернул копию оригинала
@@ -196,6 +222,8 @@ async def rewrite_query(query: str) -> list[str]:
             result.append(r)
     
     _cache_put(query, result)
+    if _METRICS_AVAILABLE:
+        QUERY_REWRITE_CACHE_SIZE.set(len(_cache))
     return result
 
 
