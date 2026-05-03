@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 import asyncpg
 
 from app.embedder import encode_query, vector_literal
+from app.query_rewriter import rewrite_query, QUERY_REWRITE
 
 log = logging.getLogger("retrieval")
 
@@ -208,8 +209,18 @@ async def hybrid_search(
         # Fallback: только FTS (legacy behavior)
         return await _fts_only(conn, spec, query, access_filter_sql, access_filter_params, limit)
     
-    # 1. Query rewriting (γ-этап — пока пропускаем)
-    search_queries = [query]  # TODO: γ.2 — expand через query_rewriter
+    # 1. Query rewriting (γ-этап) — расширяем запрос через Haiku
+    # Возвращает [original, *rewrites] или [query] если flag выключен / запрос длинный / ошибка
+    if QUERY_REWRITE:
+        try:
+            search_queries = await rewrite_query(query)
+            if len(search_queries) > 1:
+                log.debug(f"Query rewrites: {len(search_queries) - 1} variants")
+        except Exception as e:
+            log.warning(f"Query rewrite failed, using original: {e}")
+            search_queries = [query]
+    else:
+        search_queries = [query]
     
     # 2. Параллельный поиск FTS + Vector
     fts_task = asyncio.create_task(_fts_search(
