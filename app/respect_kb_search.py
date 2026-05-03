@@ -207,8 +207,16 @@ def _format_for_llm(query: str, results: list[dict]) -> str:
         lines.append(f"   [score: {score:.3f}, source: {source}]")
         
         if attachments:
-            attach_names = [att["name"] for att in attachments[:3]]
-            lines.append(f"   Файлы: {', '.join(attach_names)}")
+            # Markdown ссылки — Element рендерит их как кликабельные
+            attach_links = []
+            for att in attachments[:3]:
+                name = att.get("name") or "файл"
+                url = att.get("url")
+                if url:
+                    attach_links.append(f"[{name}]({url})")
+                else:
+                    attach_links.append(name)
+            lines.append(f"   Файлы: {', '.join(attach_links)}")
             if len(attachments) > 3:
                 lines.append(f"   ... и ещё {len(attachments)-3}")
         
