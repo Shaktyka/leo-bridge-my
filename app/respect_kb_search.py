@@ -46,7 +46,7 @@ async def respect_kb_search(
     
     # 1. Получаем список доступных content_id через ACL
     try:
-        accessible_ids = await respect_client.kb_get_accessible_content_ids(matrix_user_id)
+        accessible_ids = await respect_client.get_accessible_content_ids(matrix_user_id)
         log.debug(f"User {matrix_user_id} has access to {len(accessible_ids)} content_ids")
         
         if not accessible_ids:
