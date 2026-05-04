@@ -702,6 +702,33 @@ class Bridge:
             self.log.warning("Message from disallowed user ignored: %s", event.sender)
             await self.client.room_leave(room.room_id)
             return
+        # v1.9.2: Leo не работает в групповых чатах
+        # DM в Matrix = 2 участника (Leo + пользователь). Группа = 3+
+        if len(room.users) > 2:
+            self.log.info(
+                "[%s] groupchat detected (%d members), leaving",
+                room.room_id[:12], len(room.users)
+            )
+            try:
+                await self.client.room_send(
+                    room_id=room.room_id,
+                    message_type="m.room.message",
+                    content={
+                        "msgtype": "m.notice",
+                        "body": "Я работаю только в личных чатах. Напишите мне напрямую — найдите @leo в людях и начните диалог.",
+                    },
+                )
+            except Exception as e:
+                self.log.warning("groupchat notice failed: %s", e)
+            try:
+                await self.client.room_leave(room.room_id)
+            except Exception as e:
+                self.log.warning("groupchat leave failed: %s", e)
+            try:
+                await self.client.room_forget(room.room_id)
+            except Exception as e:
+                self.log.warning("groupchat forget failed: %s", e)
+            return
         if not self._is_addressed_to_bot(event.body, room):
             return
 
