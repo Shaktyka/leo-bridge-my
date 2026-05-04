@@ -35,6 +35,12 @@ log = logging.getLogger("retrieval")
 FTS_TOP_K = int(os.environ.get("LEO_FTS_TOP_K", "50"))
 VEC_TOP_K = int(os.environ.get("LEO_VEC_TOP_K", "50"))
 RRF_K = int(os.environ.get("LEO_RRF_K", "60"))
+
+# v1.9.1.2: вес simple-конфигурации FTS относительно russian.
+# 0.5 = simple вносит половину от russian-rank (защита от шумовых
+# совпадений простых слов). 0 = simple отключён в ранжировании,
+# но WHERE OR остаётся (карточки находятся, но с низким score).
+FTS_SIMPLE_WEIGHT = float(os.environ.get("FTS_SIMPLE_WEIGHT", "0.5"))
 # β-этап: Cohere reranker configuration
 COHERE_RERANK = os.environ.get("COHERE_RERANK", "true").lower() == "true"
 COHERE_MODEL = "rerank-multilingual-v3.0"
@@ -252,15 +258,17 @@ async def hybrid_search(
     else:
         search_queries = [query]
     
-    # 2. Параллельный поиск FTS + Vector
-    fts_task = asyncio.create_task(_fts_search(
+    # 2. Последовательный поиск FTS + Vector
+    # v1.9.1.2: убран asyncio.gather() — нельзя делать параллельные fetch()
+    # на одном asyncpg-соединении (race condition: "another operation is in
+    # progress"). Latency: ~70ms→~140ms, всё ещё в пределах SLA.
+    # TODO v1.9.2: вернуть параллелизм через два отдельных acquire() из pool.
+    fts_rows = await _fts_search(
         conn, spec, search_queries, access_filter_sql, access_filter_params
-    ))
-    vec_task = asyncio.create_task(_vector_search(
-        conn, spec, query, access_filter_sql, access_filter_params  
-    ))
-    
-    fts_rows, vec_rows = await asyncio.gather(fts_task, vec_task)
+    )
+    vec_rows = await _vector_search(
+        conn, spec, query, access_filter_sql, access_filter_params
+    )
     
     # 3. Reciprocal Rank Fusion
     rrf_results = _reciprocal_rank_fusion(fts_rows, vec_rows, k=RRF_K)
@@ -328,14 +336,25 @@ async def _fts_search(
         # $N+1 потому что params уже заняты access_filter
         param_idx = len(access_filter_params) + 1
         
-        # Улучшенный FTS: более толерантный к multi-word запросам
+        # v1.9.1.2: russian + simple параллельно. russian для смыслов,
+        # simple для имён собственных и слов которые стеммер режет неверно
+        # ("отзыв"→'отз' vs "Отзывы"→'отзыв' — лексемы не совпадают).
         sql = f"""
             SELECT {spec.pk} AS pk,
-                   ts_rank_cd({spec.fts_column}, 
-                             plainto_tsquery('russian', ${param_idx})) AS fts_rank
+                   GREATEST(
+                       ts_rank_cd({spec.fts_column},
+                                  plainto_tsquery('russian', ${param_idx})),
+                       ts_rank_cd({spec.fts_column},
+                                  plainto_tsquery('simple',  ${param_idx}))
+                           * {FTS_SIMPLE_WEIGHT}
+                   ) AS fts_rank
             FROM {spec.name}
             WHERE {access_filter_sql}
-              AND {spec.fts_column} @@ plainto_tsquery('russian', ${param_idx})
+              AND (
+                      {spec.fts_column} @@ plainto_tsquery('russian', ${param_idx})
+                      OR
+                      {spec.fts_column} @@ plainto_tsquery('simple',  ${param_idx})
+                  )
             ORDER BY fts_rank DESC 
             LIMIT {FTS_TOP_K}
         """
@@ -350,11 +369,20 @@ async def _fts_search(
                 word_query = ' | '.join(words)  # OR логика
                 fallback_sql = f"""
                     SELECT {spec.pk} AS pk,
-                           ts_rank_cd({spec.fts_column}, 
-                                     to_tsquery('russian', ${param_idx})) AS fts_rank
+                           GREATEST(
+                               ts_rank_cd({spec.fts_column},
+                                          to_tsquery('russian', ${param_idx})),
+                               ts_rank_cd({spec.fts_column},
+                                          to_tsquery('simple',  ${param_idx}))
+                                   * {FTS_SIMPLE_WEIGHT}
+                           ) AS fts_rank
                     FROM {spec.name}
                     WHERE {access_filter_sql}
-                      AND {spec.fts_column} @@ to_tsquery('russian', ${param_idx})
+                      AND (
+                              {spec.fts_column} @@ to_tsquery('russian', ${param_idx})
+                              OR
+                              {spec.fts_column} @@ to_tsquery('simple',  ${param_idx})
+                          )
                     ORDER BY fts_rank DESC 
                     LIMIT {FTS_TOP_K}
                 """
