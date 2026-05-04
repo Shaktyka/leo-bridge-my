@@ -124,9 +124,25 @@ async def _enrich_results(
             content_id,
             title,
             indexable_text,
+            body_plain,
+            section_path,
             cover_image_url,
-            ts_headline('russian', indexable_text, plainto_tsquery('russian', $1), 
-                       'MaxWords=15, MinWords=10') AS snippet
+            -- v1.9.1.2: расширенный snippet (40 слов вместо 15) +
+            -- COALESCE на simple-конфиг для подсветки слов которые
+            -- snowball-стеммер режет неверно (например "отзыв"→'отз').
+            COALESCE(
+                NULLIF(
+                    ts_headline('russian', indexable_text,
+                                plainto_tsquery('russian', $1),
+                                'MaxWords=40, MinWords=20, '
+                                'MaxFragments=2, FragmentDelimiter=" ... "'),
+                    ''
+                ),
+                ts_headline('simple', indexable_text,
+                            plainto_tsquery('simple', $1),
+                            'MaxWords=40, MinWords=20, '
+                            'MaxFragments=2, FragmentDelimiter=" ... "')
+            ) AS snippet
         FROM ai.respect_kb 
         WHERE content_id = ANY($2)
     """
@@ -175,10 +191,18 @@ async def _enrich_results(
         score = search_data.get("rrf_score") or search_data.get("fts_rank") or 0.0
         source = search_data.get("source", "unknown")
         
+        # v1.9.1.2: body_plain для коротких карточек целиком,
+        # section — путь раздела для контекста LLM.
+        body_plain = card_data.get("body_plain") or ""
+        section_path = card_data.get("section_path") or []
+        section = " → ".join(section_path) if section_path else ""
+        
         enriched.append({
             "content_id": content_id,
             "title": card_data["title"] or "",
             "snippet": card_data["snippet"] or "",
+            "body_plain": body_plain,
+            "section": section,
             "score": float(score),
             "cover_image_url": card_data["cover_image_url"],
             "attachments": attachments_by_id.get(content_id, []),
@@ -195,21 +219,35 @@ def _format_for_llm(query: str, results: list[dict]) -> str:
     
     lines = [f"Найдено {len(results)} результатов по запросу «{query}»:\n"]
     
+    BODY_INLINE_LIMIT = 2000  # для коротких карточек отдаём body_plain целиком
+    ATTACH_LIMIT = 10         # сколько вложений показать
+    
     for i, result in enumerate(results, 1):
         title = result["title"]
         snippet = result["snippet"]
+        body_plain = result.get("body_plain") or ""
+        section = result.get("section") or ""
         score = result["score"]
         source = result["source"]
         attachments = result["attachments"]
         
+        # v1.9.1.2: для коротких карточек (≤2000 симв) даём полный текст
+        # вместо обрезанного snippet — иначе LLM не видит концовку истории.
+        if body_plain and len(body_plain) <= BODY_INLINE_LIMIT:
+            content_block = body_plain
+        else:
+            content_block = snippet
+        
         lines.append(f"{i}. {title}")
-        lines.append(f"   {snippet}")
+        if section:
+            lines.append(f"   Раздел: {section}")
+        lines.append(f"   {content_block}")
         lines.append(f"   [score: {score:.3f}, source: {source}]")
         
         if attachments:
             # Markdown ссылки — Element рендерит их как кликабельные
             attach_links = []
-            for att in attachments[:3]:
+            for att in attachments[:ATTACH_LIMIT]:
                 name = att.get("name") or "файл"
                 url = att.get("url")
                 if url:
@@ -217,8 +255,8 @@ def _format_for_llm(query: str, results: list[dict]) -> str:
                 else:
                     attach_links.append(name)
             lines.append(f"   Файлы: {', '.join(attach_links)}")
-            if len(attachments) > 3:
-                lines.append(f"   ... и ещё {len(attachments)-3}")
+            if len(attachments) > ATTACH_LIMIT:
+                lines.append(f"   ... и ещё {len(attachments)-ATTACH_LIMIT}")
         
         lines.append("")
     
