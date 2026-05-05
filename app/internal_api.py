@@ -1101,5 +1101,54 @@ async def metrics_endpoint() -> _MetricsResponse:
     return _MetricsResponse(content=body, media_type=content_type)
 
 
+
+
+# === v1.9.1.3: Embedding endpoint для ingest и других subprocess ===
+from typing import List as _List
+from pydantic import BaseModel as _PydanticBaseModel
+
+
+class _EmbedRequest(_PydanticBaseModel):
+    texts: _List[str]
+    is_query: bool = False  # False = passage (для ingest), True = query (для retrieval)
+
+
+class _EmbedResponse(_PydanticBaseModel):
+    embeddings: _List[_List[float]]
+    dim: int
+    model: str
+
+
+@app.post("/internal/embed")
+async def embed_endpoint(
+    req: _EmbedRequest,
+    _: None = Depends(check_auth),  # переиспользуем существующую auth
+):
+    """
+    Возвращает embeddings для списка текстов через локальный e5-large.
+    Используется ingest.py и другими subprocess.
+    """
+    from app.embedder import encode_passages, encode_query, MODEL_TAG, EMBEDDING_DIM
+    
+    if not req.texts:
+        return _EmbedResponse(embeddings=[], dim=EMBEDDING_DIM, model=MODEL_TAG)
+    
+    if req.is_query:
+        # Query-mode: каждый текст -> отдельный embedding
+        embs = []
+        for t in req.texts:
+            emb = await encode_query(t)
+            embs.append(emb)
+    else:
+        # Passage-mode: батчевая обработка (encode_passages уже возвращает list[list[float]])
+        embs = await encode_passages(req.texts)
+    
+    return _EmbedResponse(
+        embeddings=embs,
+        dim=len(embs[0]) if embs else EMBEDDING_DIM,
+        model=MODEL_TAG,
+    )
+
+
 if __name__ == "__main__":
     serve()
